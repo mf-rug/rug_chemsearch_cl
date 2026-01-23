@@ -1,0 +1,30 @@
+# User data
+data/
+
+# Uncompressed dump (keep .gz version)
+pubchem_dump_cid_to_cas.tsv
+
+# Test files
+*.html
+*_files/
+test.txt
+cas*.txt
+cids.txt
+pubchem_cids.txt
+chemicals_table.csv
+cas_to_pubchem.csv
+biotech_chemicals_*.txt
+page_after_js.html
+
+# Build artifacts
+build/
+dist/
+build_venv/
+*.pyc
+__pycache__/
+
+# Other
+.DS_Store
+get_all_chemicals.py
+pythonLocSt.py
+README_BUILD.md
