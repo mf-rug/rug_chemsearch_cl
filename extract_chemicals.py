@@ -25,11 +25,12 @@ from pathlib import Path
 from urllib.parse import quote
 
 # Fix for PyInstaller Windows builds with console=False
-# Without a console, sys.stdout/stderr are None which breaks print()
+# Redirect output to a log file so users can check progress
 if sys.stdout is None:
-    sys.stdout = open(os.devnull, 'w')
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, 'w')
+    _log_path = os.path.join(os.path.dirname(sys.executable), "chemical_extractor.log")
+    _log_file = open(_log_path, 'a', encoding='utf-8', buffering=1)  # line buffered
+    sys.stdout = _log_file
+    sys.stderr = _log_file
 
 import aiohttp
 import pandas as pd
@@ -363,6 +364,7 @@ def load_pubchem_dump() -> dict[str, int]:
         return _pubchem_dump_cache
 
     print(f"Loading PubChem dump from {PUBCHEM_DUMP_FILE}...")
+    start_time = time.time()
     cas_to_cid = {}
 
     with gzip.open(PUBCHEM_DUMP_FILE, "rt") as f:  # "rt" = read text mode
@@ -375,7 +377,8 @@ def load_pubchem_dump() -> dict[str, int]:
                 except ValueError:
                     continue
 
-    print(f"Loaded {len(cas_to_cid):,} CAS→CID mappings from PubChem dump")
+    elapsed = time.time() - start_time
+    print(f"Loaded {len(cas_to_cid):,} CAS→CID mappings in {elapsed:.1f}s")
     _pubchem_dump_cache = cas_to_cid
     return _pubchem_dump_cache
 

@@ -10,13 +10,18 @@ A simple Flask app providing a browser-based interface to:
 
 import os
 import sys
+from datetime import datetime
 
 # Fix for PyInstaller Windows builds with console=False
-# Without a console, sys.stdout/stderr are None which breaks print()
+# Redirect output to a log file so users can check progress
 if sys.stdout is None:
-    sys.stdout = open(os.devnull, 'w')
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, 'w')
+    _log_path = os.path.join(os.path.dirname(sys.executable), "chemical_extractor.log")
+    _log_file = open(_log_path, 'a', encoding='utf-8', buffering=1)  # line buffered
+    sys.stdout = _log_file
+    sys.stderr = _log_file
+    print(f"\n{'='*50}")
+    print(f"Session started: {datetime.now().isoformat()}")
+    print(f"{'='*50}")
 
 import json
 from datetime import datetime
