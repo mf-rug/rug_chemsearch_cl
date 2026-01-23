@@ -24,6 +24,13 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
+# Fix for PyInstaller Windows builds with console=False
+# Without a console, sys.stdout/stderr are None which breaks print()
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w')
+
 import aiohttp
 import pandas as pd
 import requests

@@ -8,6 +8,16 @@ A simple Flask app providing a browser-based interface to:
 - View results and open PubChem searches
 """
 
+import os
+import sys
+
+# Fix for PyInstaller Windows builds with console=False
+# Without a console, sys.stdout/stderr are None which breaks print()
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w')
+
 import json
 from datetime import datetime
 from pathlib import Path
