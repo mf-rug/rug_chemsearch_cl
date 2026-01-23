@@ -114,6 +114,7 @@ a = Analysis(
         'pytest',
         'setuptools',
         'pip',
+        'tzdata',  # Timezone database - not needed, and slow to unzip (thousands of small files)
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
