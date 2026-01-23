@@ -55,6 +55,16 @@ from extract_chemicals import (
 
 app = Flask(__name__)
 
+
+def is_setup_complete():
+    """Check if initial setup is complete (has valid CID cache)."""
+    cache = load_cid_cache()
+    if not cache or "results" not in cache:
+        return False
+    cids = [r for r in cache["results"].values() if r.get("cid")]
+    return len(cids) > 0
+
+
 # ============================================================================
 # HTML Templates (inline for simplicity)
 # ============================================================================
@@ -65,7 +75,7 @@ BASE_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ title }} - Chemical Extractor</title>
+    <title>{{ title }} - Chemical Search</title>
     <style>
         :root {
             --bg: #1a1a2e;
@@ -88,7 +98,7 @@ BASE_TEMPLATE = """
         .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
         header {
             background: var(--bg-light);
-            padding: 20px 0;
+            padding: 15px 0;
             margin-bottom: 30px;
             border-bottom: 2px solid var(--accent);
         }
@@ -99,16 +109,28 @@ BASE_TEMPLATE = """
         }
         h1 { font-size: 1.5rem; }
         h1 span { color: var(--highlight); }
+        nav { display: flex; align-items: center; gap: 10px; }
         nav a {
             color: var(--text);
             text-decoration: none;
-            margin-left: 20px;
             padding: 8px 16px;
             border-radius: 4px;
             transition: background 0.2s;
         }
         nav a:hover { background: var(--accent); }
         nav a.active { background: var(--highlight); }
+        .nav-divider { width: 1px; height: 24px; background: var(--accent); margin: 0 5px; }
+        .btn-quit {
+            background: transparent;
+            border: 1px solid var(--text-dim);
+            color: var(--text-dim);
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: all 0.2s;
+        }
+        .btn-quit:hover { border-color: var(--highlight); color: var(--highlight); }
 
         .card {
             background: var(--bg-light);
@@ -229,7 +251,12 @@ BASE_TEMPLATE = """
         .btn:hover { opacity: 0.9; }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-secondary { background: var(--accent); }
-        .btn-success { background: var(--success); }
+        .btn-success { background: var(--success); color: #000; }
+        .btn-large {
+            padding: 16px 32px;
+            font-size: 1.1rem;
+            font-weight: 500;
+        }
 
         .badge {
             display: inline-block;
@@ -279,17 +306,50 @@ BASE_TEMPLATE = """
             font-size: 0.9rem;
         }
         select:focus, input:focus { outline: 2px solid var(--highlight); }
+
+        /* Collapsible sections */
+        .collapsible-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+            padding: 10px 0;
+        }
+        .collapsible-header:hover { opacity: 0.8; }
+        .collapsible-content { display: none; padding-top: 15px; }
+        .collapsible-content.open { display: block; }
+        .toggle-icon { font-size: 0.8rem; color: var(--text-dim); }
+
+        /* Search page specific */
+        .search-hero {
+            text-align: center;
+            padding: 30px 20px;
+            background: linear-gradient(135deg, var(--bg-light) 0%, var(--accent) 100%);
+            border-radius: 12px;
+            margin-bottom: 25px;
+        }
+        .search-hero h2 {
+            font-size: 1.4rem;
+            margin-bottom: 20px;
+            border: none;
+            color: var(--text);
+        }
+        .search-status {
+            font-size: 0.9rem;
+            color: var(--text-dim);
+            margin-top: 15px;
+        }
     </style>
 </head>
 <body>
     <header>
         <div class="container">
-            <h1>Chemical <span>Extractor</span></h1>
+            <h1>Chemical <span>Search</span></h1>
             <nav>
-                <a href="{{ url_for('index') }}" class="{{ 'active' if active_page == 'home' else '' }}">Dashboard</a>
-                <a href="{{ url_for('snapshots') }}" class="{{ 'active' if active_page == 'snapshots' else '' }}">Exports</a>
-                <a href="{{ url_for('results') }}" class="{{ 'active' if active_page == 'results' else '' }}">PubChem Results</a>
-                <a href="{{ url_for('combine') }}" class="{{ 'active' if active_page == 'combine' else '' }}">Combine</a>
+                <a href="{{ url_for('search') }}" class="{{ 'active' if active_page == 'search' else '' }}">Search</a>
+                <a href="{{ url_for('setup') }}" class="{{ 'active' if active_page == 'setup' else '' }}">Setup</a>
+                <span class="nav-divider"></span>
+                <button class="btn-quit" onclick="quitApp()">Quit App</button>
             </nav>
         </div>
     </header>
@@ -298,10 +358,10 @@ BASE_TEMPLATE = """
     </main>
     <script>
         // Helper for async actions with loading state
-        async function runAction(url, btn) {
+        async function runAction(url, btn, options = {}) {
             const originalText = btn.innerHTML;
             btn.disabled = true;
-            btn.innerHTML = '<span class="loading"></span> Processing...';
+            btn.innerHTML = '<span class="loading"></span> ' + (options.loadingText || 'Processing...');
 
             try {
                 const resp = await fetch(url, { method: 'POST' });
@@ -322,13 +382,311 @@ BASE_TEMPLATE = """
                 btn.innerHTML = originalText;
             }
         }
+
+        async function quitApp() {
+            if (confirm('Quit the Chemical Search application?')) {
+                try {
+                    await fetch('/api/quit', { method: 'POST' });
+                } catch (e) {
+                    // Expected - server shuts down
+                }
+                document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#888;"><p>Application closed. You can close this tab.</p></div>';
+            }
+        }
     </script>
     {% block scripts %}{% endblock %}
 </body>
 </html>
 """
 
-INDEX_TEMPLATE = """
+SEARCH_TEMPLATE = """
+{% extends "base" %}
+{% block content %}
+{% if not has_cids %}
+<div class="alert alert-info">
+    <p><strong>Setup Required</strong></p>
+    <p style="margin-top: 8px;">Before you can search, you need to import your chemicals database and look them up in PubChem.</p>
+    <a href="{{ url_for('setup') }}" class="btn" style="margin-top: 15px;">Go to Setup</a>
+</div>
+{% else %}
+
+<div class="search-hero">
+    <h2>Search Your {{ cid_count }} Chemicals</h2>
+
+    {% if selected_search %}
+    <button class="btn btn-success btn-large" onclick="combineSelectedSearch('AND', this)" id="btn-main-search">
+        Find matching chemicals
+    </button>
+    <div class="search-status">
+        Searching for: <strong>{{ selected_search.name }}</strong>
+        <span class="text-dim">({{ selected_search.list_size|default('?') }} results)</span>
+    </div>
+    {% else %}
+    <button class="btn btn-large" onclick="window.open('https://pubchem.ncbi.nlm.nih.gov/', '_blank')">
+        Start a New Search on PubChem
+    </button>
+    <div class="search-status">
+        Search for any structure, property, or keyword on PubChem, then come back here.
+    </div>
+    {% endif %}
+</div>
+
+<div class="card">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+        <div class="card-header" style="border: none; margin: 0; padding: 0;">
+            <h2 style="margin: 0;">Recent PubChem Searches</h2>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="text-dim" style="font-size: 0.8rem;" id="auto-refresh-status"></span>
+            <button class="btn btn-secondary" style="padding: 5px 12px; font-size: 0.8rem;" onclick="refreshHistory()">
+                Refresh
+            </button>
+        </div>
+    </div>
+
+    <div id="history-container" style="max-height: 350px; overflow-y: auto; margin-bottom: 20px;">
+        <table id="history-table">
+            <thead>
+                <tr>
+                    <th style="width: 30px;"></th>
+                    <th>Search Query</th>
+                    <th>Results</th>
+                    <th>When</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody id="history-body">
+                <tr><td colspan="5" class="text-dim" style="text-align: center; padding: 20px;">
+                    <span class="loading" style="width: 14px; height: 14px;"></span> Loading...
+                </td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="actions">
+        <button class="btn btn-success" onclick="combineSelectedSearch('AND', this)" disabled id="btn-combine-and">
+            Find in My Chemicals (AND)
+        </button>
+        <button class="btn btn-secondary" onclick="combineSelectedSearch('NOT', this)" disabled id="btn-combine-not">
+            Exclude from My Chemicals (NOT)
+        </button>
+    </div>
+    <p class="text-dim" style="margin-top: 15px; font-size: 0.85rem;">
+        <strong>AND:</strong> Which of my chemicals match this search? &nbsp;
+        <strong>NOT:</strong> Which of my chemicals do NOT match this search?
+    </p>
+</div>
+
+<div class="card">
+    <div class="collapsible-header" onclick="toggleSection('new-search-section')">
+        <h2 style="margin: 0; border: none; padding: 0;">New Search</h2>
+        <span class="toggle-icon" id="new-search-section-icon">+ expand</span>
+    </div>
+    <div class="collapsible-content" id="new-search-section">
+        <p style="margin-bottom: 15px;">
+            To search for specific structures, properties, or keywords:
+        </p>
+        <ol style="margin-left: 20px; margin-bottom: 15px; color: var(--text-dim);">
+            <li>Click the button below to open PubChem</li>
+            <li>Search for what you're interested in (e.g., "flammable", a structure, etc.)</li>
+            <li>Come back here - your search will appear in the list above</li>
+        </ol>
+        <button class="btn" onclick="window.open('https://pubchem.ncbi.nlm.nih.gov/', '_blank')">
+            Open PubChem
+        </button>
+    </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+let selectedCacheKey = null;
+let searchHistory = [];
+let autoRefreshInterval = null;
+
+async function loadHistory() {
+    const tbody = document.getElementById('history-body');
+    if (!tbody) return;
+
+    try {
+        const resp = await fetch('/api/pubchem-history');
+        const data = await resp.json();
+        searchHistory = data.history || [];
+
+        if (searchHistory.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="5" class="text-dim" style="text-align: center; padding: 30px;">
+                No recent PubChem searches found.<br><br>
+                <button class="btn" onclick="window.open('https://pubchem.ncbi.nlm.nih.gov/', '_blank')">
+                    Search on PubChem
+                </button>
+            </td></tr>`;
+            updateButtons();
+            return;
+        }
+
+        tbody.innerHTML = searchHistory.map((entry, idx) => `
+            <tr onclick="selectEntry('${entry.cachekey}')"
+                data-cachekey="${entry.cachekey}"
+                style="cursor: pointer;"
+                class="${idx === 0 ? 'selected' : ''}">
+                <td style="text-align: center;">
+                    <input type="radio" name="search-select" value="${entry.cachekey}" ${idx === 0 ? 'checked' : ''}
+                           onclick="event.stopPropagation(); selectEntry('${entry.cachekey}')">
+                </td>
+                <td style="max-width: 350px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
+                    title="${entry.name}">${entry.name}</td>
+                <td>${entry.list_size ? entry.list_size.toLocaleString() : '-'}</td>
+                <td class="text-dim" style="font-size: 0.85rem;">${formatTime(entry.timestamp)}</td>
+                <td><a href="${entry.url}" target="_blank" onclick="event.stopPropagation();"
+                       style="color: var(--highlight); font-size: 0.85rem;">View</a></td>
+            </tr>
+        `).join('');
+
+        // Select first entry by default
+        if (searchHistory.length > 0) {
+            selectedCacheKey = searchHistory[0].cachekey;
+        }
+        updateButtons();
+
+    } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="5" class="text-warning" style="text-align: center; padding: 20px;">
+            Error loading search history: ${e.message}
+        </td></tr>`;
+    }
+}
+
+function formatTime(isoTimestamp) {
+    if (!isoTimestamp) return 'Unknown';
+    const date = new Date(isoTimestamp);
+    const now = new Date();
+    const diffMs = now - date;
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+
+    if (diffMins < 1) return 'Just now';
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays < 7) return `${diffDays}d ago`;
+    return date.toLocaleDateString();
+}
+
+function selectEntry(cachekey) {
+    selectedCacheKey = cachekey;
+
+    document.querySelectorAll('#history-body tr').forEach(row => {
+        const isSelected = row.dataset.cachekey === cachekey;
+        row.classList.toggle('selected', isSelected);
+        const radio = row.querySelector('input[type="radio"]');
+        if (radio) radio.checked = isSelected;
+    });
+
+    updateButtons();
+}
+
+function updateButtons() {
+    const hasSelection = selectedCacheKey !== null;
+    const btnAnd = document.getElementById('btn-combine-and');
+    const btnNot = document.getElementById('btn-combine-not');
+    const btnMain = document.getElementById('btn-main-search');
+    if (btnAnd) btnAnd.disabled = !hasSelection;
+    if (btnNot) btnNot.disabled = !hasSelection;
+    if (btnMain) btnMain.disabled = !hasSelection;
+}
+
+async function combineSelectedSearch(operation, btn) {
+    if (!selectedCacheKey) {
+        alert('Please select a search from the list first.');
+        return;
+    }
+
+    const originalText = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="loading"></span> Searching...';
+
+    try {
+        const resp = await fetch('/api/combine-pubchem/' + operation + '?cachekey=' + encodeURIComponent(selectedCacheKey), { method: 'POST' });
+        const data = await resp.json();
+
+        if (data.error) {
+            alert('Error: ' + data.error);
+        } else if (data.pubchem_url) {
+            window.open(data.pubchem_url, '_blank');
+        }
+    } catch (e) {
+        alert('Error: ' + e.message);
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = originalText;
+        updateButtons();
+    }
+}
+
+async function refreshHistory() {
+    const tbody = document.getElementById('history-body');
+    if (tbody) {
+        tbody.innerHTML = `<tr><td colspan="5" class="text-dim" style="text-align: center; padding: 20px;">
+            <span class="loading" style="width: 14px; height: 14px;"></span> Refreshing...
+        </td></tr>`;
+    }
+    const previousKey = selectedCacheKey;
+    selectedCacheKey = null;
+    await loadHistory();
+    // Try to re-select previous selection
+    if (previousKey && searchHistory.find(h => h.cachekey === previousKey)) {
+        selectEntry(previousKey);
+    }
+}
+
+function toggleSection(id) {
+    const content = document.getElementById(id);
+    const icon = document.getElementById(id + '-icon');
+    if (content.classList.contains('open')) {
+        content.classList.remove('open');
+        icon.textContent = '+ expand';
+    } else {
+        content.classList.add('open');
+        icon.textContent = '- collapse';
+    }
+}
+
+function startAutoRefresh() {
+    const statusEl = document.getElementById('auto-refresh-status');
+    let countdown = 30;
+
+    function updateStatus() {
+        if (statusEl) {
+            statusEl.textContent = `Auto-refresh in ${countdown}s`;
+        }
+    }
+
+    updateStatus();
+
+    autoRefreshInterval = setInterval(async () => {
+        countdown--;
+        if (countdown <= 0) {
+            countdown = 30;
+            await refreshHistory();
+        }
+        updateStatus();
+    }, 1000);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    loadHistory();
+    startAutoRefresh();
+});
+
+// Cleanup on page leave
+window.addEventListener('beforeunload', () => {
+    if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+});
+</script>
+{% endblock %}
+"""
+
+SETUP_TEMPLATE = """
 {% extends "base" %}
 {% block content %}
 <div class="stats">
@@ -350,72 +708,31 @@ INDEX_TEMPLATE = """
     </div>
 </div>
 
+{% if setup_complete %}
+<div class="alert alert-success">
+    <p><strong>Setup Complete!</strong> You have {{ cache_stats.found_cids }} chemicals ready to search.</p>
+    <a href="{{ url_for('search') }}" class="btn btn-success" style="margin-top: 10px;">Go to Search</a>
+</div>
+{% endif %}
+
 <div class="card">
-    <div class="card-header">
-        <h2>Current Database Export</h2>
-        <span class="info">?<span class="tip">A database export is a saved HTML file containing the chemicals table from the RUG inventory system. Each export is a point-in-time snapshot of the database.</span></span>
-    </div>
+    <h2>Step 1: Import Chemicals Database</h2>
     {% if latest_snapshot %}
-    <p><strong>Active export:</strong> <span class="mono">{{ latest_snapshot.name }}</span></p>
+    <p><strong>Current database:</strong> <span class="mono">{{ latest_snapshot.name }}</span></p>
     <p class="text-dim">{{ latest_snapshot.timestamp.strftime('%Y-%m-%d %H:%M:%S') }} &bull; {{ (latest_snapshot.size / 1024)|round(1) }} KB</p>
-    {% if cache_valid %}
-    <p class="text-success" style="margin-top: 10px;">PubChem lookups are cached and ready</p>
     {% else %}
-    <p class="text-warning" style="margin-top: 10px;">PubChem lookups needed (new export or no cache yet)</p>
+    <p class="text-warning">No database imported yet.</p>
     {% endif %}
-    {% else %}
-    <p class="text-dim">No database exports found. Use "Fetch from RUG" below or upload an HTML file.</p>
-    {% endif %}
-</div>
 
-<div class="card">
-    <div class="card-header">
-        <h2>Actions</h2>
-    </div>
-    <div class="actions">
-        {% if latest_snapshot %}
-        <button class="btn" onclick="runAction('{{ url_for('run_extraction') }}', this)">
-            Look up in PubChem
-            <span class="info" style="margin-left: 4px; background: rgba(255,255,255,0.2);">?<span class="tip">Extracts CAS numbers from the current database export and looks them up in PubChem to find matching compound IDs (CIDs). Uses cached results when available.</span></span>
-        </button>
-        <button class="btn btn-secondary" onclick="runAction('{{ url_for('run_extraction') }}?refresh_cids=1', this)">
-            Re-lookup All
-            <span class="info" style="margin-left: 4px;">?<span class="tip">Forces a fresh lookup of all CAS numbers in PubChem, ignoring any cached results. Use this if you think PubChem data may have been updated.</span></span>
-        </button>
-        {% endif %}
-        <a href="{{ url_for('snapshots') }}" class="btn btn-secondary">
-            Manage Exports
-            <span class="info" style="margin-left: 4px;">?<span class="tip">View all saved database exports, upload new HTML files, or switch between different exports.</span></span>
-        </a>
-        {% if cache_stats and cache_stats.found_cids > 0 %}
-        <button class="btn btn-success" onclick="runAction('{{ url_for('open_pubchem') }}', this)">
-            Open in PubChem
-            <span class="info" style="margin-left: 4px; background: rgba(0,0,0,0.2);">?<span class="tip">Opens all matched compounds in PubChem's web interface, where you can browse, filter, and analyze the chemical data.</span></span>
-        </button>
-        {% endif %}
-        {% if cache_stats and cache_stats.found_cids > 0 %}
-        <a href="{{ url_for('combine') }}" class="btn btn-secondary">
-            Combine with Firefox Search
-            <span class="info" style="margin-left: 4px;">?<span class="tip">Combine your RUG chemicals with a PubChem search from Firefox (e.g., find which of your chemicals are "flammable").</span></span>
-        </a>
-        {% endif %}
-    </div>
-</div>
-
-<div class="card">
-    <div class="card-header">
-        <h2>Fetch from RUG</h2>
-        <span class="info">?<span class="tip">Automatically logs into the RUG chemicals inventory system and downloads a fresh export of all chemicals. Requires you to complete the login (including MFA) in the browser window that opens.</span></span>
-    </div>
-    <div class="actions" id="rug-actions">
-        <button class="btn btn-secondary" id="btn-open-login" onclick="openRugLogin(this)">
-            Open RUG Login
+    <div class="actions" style="margin-top: 15px;" id="rug-actions">
+        <button class="btn" id="btn-open-login" onclick="openRugLogin(this)">
+            Fetch from RUG System
         </button>
         <button class="btn btn-success" id="btn-continue" onclick="continueAfterLogin(this)" style="display: none;">
             Continue
         </button>
     </div>
-    <p class="text-dim" style="margin-top: 12px; font-size: 0.85rem;" id="rug-instructions">
+    <p class="text-dim" style="margin-top: 10px; font-size: 0.85rem;" id="rug-instructions">
         Opens Chrome for you to log in. After login, click Continue to fetch all chemicals.
     </p>
     <div id="browser-refresh-status" style="margin-top: 15px; display: none;">
@@ -423,16 +740,148 @@ INDEX_TEMPLATE = """
     </div>
 </div>
 
-{% if cache_created %}
 <div class="card">
-    <div class="card-header">
-        <h2>Cache Status</h2>
-        <span class="info">?<span class="tip">PubChem lookup results are cached locally to avoid repeated API calls. The cache is automatically invalidated when you switch to a different database export.</span></span>
+    <h2>Step 2: Look Up in PubChem</h2>
+    {% if not latest_snapshot %}
+    <p class="text-dim">Import a database first (Step 1)</p>
+    {% elif cache_valid %}
+    <p class="text-success">PubChem lookups are cached and ready.</p>
+    <p class="text-dim" style="margin-top: 5px;">Last lookup: {{ cache_created }}</p>
+    <div class="actions" style="margin-top: 15px;">
+        <button class="btn btn-secondary" onclick="runAction('{{ url_for('run_extraction') }}?refresh_cids=1', this, {loadingText: 'Looking up...'})">
+            Re-lookup All (refresh cache)
+        </button>
     </div>
-    <p><strong>Last lookup:</strong> {{ cache_created }}</p>
-    <p class="text-dim"><strong>Based on:</strong> <span class="mono">{{ cache_source }}</span></p>
+    {% else %}
+    <p class="text-warning">PubChem lookups needed.</p>
+    <div class="actions" style="margin-top: 15px;">
+        <button class="btn" onclick="runAction('{{ url_for('run_extraction') }}', this, {loadingText: 'Looking up (this may take a while)...'})">
+            Look Up in PubChem
+        </button>
+    </div>
+    {% endif %}
 </div>
-{% endif %}
+
+<!-- Collapsible: Manage Exports -->
+<div class="card">
+    <div class="collapsible-header" onclick="toggleSection('manage-exports')">
+        <h2 style="margin: 0; border: none; padding: 0;">Manage Exports</h2>
+        <span class="toggle-icon" id="manage-exports-icon">+ expand</span>
+    </div>
+    <div class="collapsible-content" id="manage-exports">
+        <div style="margin-bottom: 20px;">
+            <h3 style="font-size: 0.95rem; color: var(--text-dim); margin-bottom: 10px;">Upload HTML File</h3>
+            <form action="{{ url_for('upload_snapshot') }}" method="post" enctype="multipart/form-data" style="display: flex; gap: 10px; align-items: center;">
+                <input type="file" name="file" accept=".html,.htm" required>
+                <button type="submit" class="btn btn-secondary">Upload</button>
+            </form>
+        </div>
+
+        {% if snapshots %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>Size</th>
+                    <th>Status</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for snap in snapshots %}
+                <tr>
+                    <td>{{ snap.timestamp.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td>{{ (snap.size / 1024)|round(1) }} KB</td>
+                    <td>
+                        {% if snap.is_latest %}
+                        <span class="badge badge-success">Active</span>
+                        {% else %}
+                        <span class="badge badge-dim">Archived</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if not snap.is_latest %}
+                        <button class="btn btn-secondary" style="padding: 4px 8px; font-size: 0.75rem;"
+                                onclick="runAction('{{ url_for('set_latest', filename=snap.path.name) }}', this)">
+                            Use This
+                        </button>
+                        {% endif %}
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p class="text-dim">No exports yet.</p>
+        {% endif %}
+    </div>
+</div>
+
+<!-- Collapsible: View Results -->
+<div class="card">
+    <div class="collapsible-header" onclick="toggleSection('view-results')">
+        <h2 style="margin: 0; border: none; padding: 0;">View PubChem Results</h2>
+        <span class="toggle-icon" id="view-results-icon">+ expand</span>
+    </div>
+    <div class="collapsible-content" id="view-results">
+        {% if cache_stats and cache_stats.found_cids > 0 %}
+        <div class="actions" style="margin-bottom: 15px;">
+            <button class="btn btn-success" onclick="runAction('{{ url_for('open_pubchem') }}', this)">
+                Open All in PubChem
+            </button>
+            <a href="{{ url_for('download_cids') }}" class="btn btn-secondary">Download CIDs</a>
+            <a href="{{ url_for('download_mapping') }}" class="btn btn-secondary">Download Full Mapping</a>
+        </div>
+
+        <div style="margin-bottom: 10px;">
+            <label>Filter: </label>
+            <select id="filter-select" onchange="filterTable()">
+                <option value="all">All ({{ cache_stats.total_cas }})</option>
+                <option value="found">Matched ({{ cache_stats.found_cids }})</option>
+                <option value="not_found">No match ({{ cache_stats.not_found }})</option>
+            </select>
+        </div>
+        <div id="results-table" style="max-height: 300px; overflow-y: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>CAS Number</th>
+                        <th>Status</th>
+                        <th>PubChem CID</th>
+                    </tr>
+                </thead>
+                <tbody id="results-body">
+                {% for cas, data in results[:200] %}
+                    <tr data-status="{{ data.status }}">
+                        <td class="mono">{{ cas }}</td>
+                        <td>
+                            {% if data.cid %}
+                            <span class="badge badge-success">Matched</span>
+                            {% else %}
+                            <span class="badge badge-warning">No Match</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if data.cid %}
+                            <a href="https://pubchem.ncbi.nlm.nih.gov/compound/{{ data.cid }}"
+                               target="_blank" class="mono" style="color: var(--success);">{{ data.cid }}</a>
+                            {% else %}
+                            <span class="text-dim">-</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% if cache_stats.total_cas > 200 %}
+        <p class="text-dim" style="margin-top: 10px;">Showing first 200 of {{ cache_stats.total_cas }} results.</p>
+        {% endif %}
+        {% else %}
+        <p class="text-dim">No results yet. Complete Steps 1 and 2 first.</p>
+        {% endif %}
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -477,11 +926,10 @@ async function openRugLogin(btn) {
 
 async function continueAfterLogin(btn) {
     if (!rugSessionId) {
-        alert('No active session. Please click "Open RUG Login" first.');
+        alert('No active session. Please click "Fetch from RUG System" first.');
         return;
     }
 
-    const statusDiv = document.getElementById('browser-refresh-status');
     const statusText = document.getElementById('refresh-status-text');
     const spinner = document.getElementById('status-spinner');
     const btnOpen = document.getElementById('btn-open-login');
@@ -514,171 +962,19 @@ async function continueAfterLogin(btn) {
         rugSessionId = null;
     }
 }
-</script>
-{% endblock %}
-"""
 
-SNAPSHOTS_TEMPLATE = """
-{% extends "base" %}
-{% block content %}
-<div class="card">
-    <div class="card-header">
-        <h2>Upload Export</h2>
-        <span class="info">?<span class="tip">Upload an HTML file saved from the RUG chemicals inventory. The file should contain the chemicals table with CAS numbers.</span></span>
-    </div>
-    <form action="{{ url_for('upload_snapshot') }}" method="post" enctype="multipart/form-data" style="display: flex; gap: 10px; align-items: center;">
-        <input type="file" name="file" accept=".html,.htm" required>
-        <button type="submit" class="btn">Upload</button>
-    </form>
-</div>
+function toggleSection(id) {
+    const content = document.getElementById(id);
+    const icon = document.getElementById(id + '-icon');
+    if (content.classList.contains('open')) {
+        content.classList.remove('open');
+        icon.textContent = '+ expand';
+    } else {
+        content.classList.add('open');
+        icon.textContent = '- collapse';
+    }
+}
 
-<div class="card">
-    <div class="card-header">
-        <h2>Database Exports</h2>
-        <span class="info">?<span class="tip">Each export is a saved HTML file from the RUG chemicals database. The "Active" export is the one currently used for PubChem lookups. You can switch between exports to compare different points in time.</span></span>
-    </div>
-    {% if snapshots %}
-    <table>
-        <thead>
-            <tr>
-                <th>Export Date</th>
-                <th>Filename</th>
-                <th>Size</th>
-                <th>Status</th>
-                <th>Actions</th>
-            </tr>
-        </thead>
-        <tbody>
-        {% for snap in snapshots %}
-            <tr>
-                <td>{{ snap.timestamp.strftime('%Y-%m-%d %H:%M:%S') }}</td>
-                <td class="mono">{{ snap.path.name }}</td>
-                <td>{{ (snap.size / 1024)|round(1) }} KB</td>
-                <td>
-                    {% if snap.is_latest %}
-                    <span class="badge badge-success">Active</span>
-                    {% else %}
-                    <span class="badge badge-dim">Archived</span>
-                    {% endif %}
-                </td>
-                <td>
-                    {% if not snap.is_latest %}
-                    <button class="btn btn-secondary" style="padding: 5px 10px; font-size: 0.8rem;"
-                            onclick="runAction('{{ url_for('set_latest', filename=snap.path.name) }}', this)">
-                        Use This Export
-                    </button>
-                    {% endif %}
-                </td>
-            </tr>
-        {% endfor %}
-        </tbody>
-    </table>
-    {% else %}
-    <p class="text-dim">No database exports found. Upload an HTML file above or use "Fetch from RUG" on the Dashboard.</p>
-    {% endif %}
-</div>
-{% endblock %}
-"""
-
-RESULTS_TEMPLATE = """
-{% extends "base" %}
-{% block content %}
-{% if not cache %}
-<div class="alert alert-info">
-    <p>No PubChem lookup results yet. Click "Look up in PubChem" on the Dashboard to get started.</p>
-    <a href="{{ url_for('index') }}" class="btn" style="margin-top: 10px;">Go to Dashboard</a>
-</div>
-{% else %}
-<div class="stats">
-    <div class="stat">
-        <div class="stat-value text-success">{{ cache.stats.found_cids }}</div>
-        <div class="stat-label">Matched in PubChem</div>
-    </div>
-    <div class="stat">
-        <div class="stat-value text-warning">{{ cache.stats.not_found }}</div>
-        <div class="stat-label">No Match Found</div>
-    </div>
-    <div class="stat">
-        <div class="stat-value">{{ cache.stats.total_cas }}</div>
-        <div class="stat-label">Total Chemicals</div>
-    </div>
-</div>
-
-<div class="card">
-    <div class="card-header">
-        <h2>Export &amp; View</h2>
-    </div>
-    <div class="actions">
-        <button class="btn btn-success" onclick="runAction('{{ url_for('open_pubchem') }}', this)">
-            Open All in PubChem
-            <span class="info" style="margin-left: 4px; background: rgba(0,0,0,0.2);">?<span class="tip">Opens all {{ cache.stats.found_cids }} matched compounds in PubChem's web interface for browsing, filtering, and analysis.</span></span>
-        </button>
-        <a href="{{ url_for('download_cids') }}" class="btn btn-secondary">
-            Download CIDs
-            <span class="info" style="margin-left: 4px;">?<span class="tip">Download a plain text file with one PubChem CID per line. Useful for importing into other tools.</span></span>
-        </a>
-        <a href="{{ url_for('download_mapping') }}" class="btn btn-secondary">
-            Download Full Mapping
-            <span class="info" style="margin-left: 4px;">?<span class="tip">Download a CSV file with CAS numbers, lookup status, and PubChem CIDs. Includes both matched and unmatched chemicals.</span></span>
-        </a>
-    </div>
-</div>
-
-<div class="card">
-    <div class="card-header">
-        <h2>CAS → PubChem Mapping</h2>
-        <span class="info">?<span class="tip">Shows the mapping from CAS Registry Numbers (from your database export) to PubChem Compound IDs (CIDs). Click any CID to view the compound in PubChem.</span></span>
-    </div>
-    <div style="margin-bottom: 10px;">
-        <label>Show: </label>
-        <select id="filter-select" onchange="filterTable()">
-            <option value="all">All chemicals ({{ cache.stats.total_cas }})</option>
-            <option value="found">Matched in PubChem ({{ cache.stats.found_cids }})</option>
-            <option value="not_found">No match found ({{ cache.stats.not_found }})</option>
-        </select>
-    </div>
-    <div id="results-table">
-        <table>
-            <thead>
-                <tr>
-                    <th>CAS Number <span class="info">?<span class="tip">CAS Registry Number - a unique identifier for chemical substances assigned by the Chemical Abstracts Service.</span></span></th>
-                    <th>Status</th>
-                    <th>PubChem CID <span class="info">?<span class="tip">PubChem Compound ID - a unique identifier in NCBI's PubChem database. Click to view full compound details.</span></span></th>
-                </tr>
-            </thead>
-            <tbody id="results-body">
-            {% for cas, data in results[:500] %}
-                <tr data-status="{{ data.status }}">
-                    <td class="mono">{{ cas }}</td>
-                    <td>
-                        {% if data.cid %}
-                        <span class="badge badge-success">Matched</span>
-                        {% else %}
-                        <span class="badge badge-warning">No Match</span>
-                        {% endif %}
-                    </td>
-                    <td>
-                        {% if data.cid %}
-                        <a href="https://pubchem.ncbi.nlm.nih.gov/compound/{{ data.cid }}"
-                           target="_blank" class="mono" style="color: var(--success);">{{ data.cid }}</a>
-                        {% else %}
-                        <span class="text-dim">-</span>
-                        {% endif %}
-                    </td>
-                </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-    </div>
-    {% if cache.stats.total_cas > 500 %}
-    <p class="text-dim" style="margin-top: 10px;">Showing first 500 of {{ cache.stats.total_cas }} results.</p>
-    {% endif %}
-</div>
-{% endif %}
-{% endblock %}
-
-{% block scripts %}
-<script>
 function filterTable() {
     const filter = document.getElementById('filter-select').value;
     const rows = document.querySelectorAll('#results-body tr');
@@ -699,212 +995,14 @@ function filterTable() {
 {% endblock %}
 """
 
-COMBINE_TEMPLATE = """
-{% extends "base" %}
-{% block content %}
-{% if not has_cids %}
-<div class="alert alert-info">
-    <p>No PubChem results yet. Run a CID lookup on the Dashboard first.</p>
-    <a href="{{ url_for('index') }}" class="btn" style="margin-top: 10px;">Go to Dashboard</a>
-</div>
-{% else %}
-<div class="card">
-    <div class="card-header">
-        <h2>Combine with Firefox PubChem Search</h2>
-        <span class="info">?<span class="tip">Select a PubChem search from your Firefox history and combine it with your {{ cid_count }} matched RUG chemicals using AND, OR, or NOT operations.</span></span>
-    </div>
-
-    <p style="margin-bottom: 15px; font-size: 0.9rem;">
-        Select a search from your Firefox PubChem history below, then combine it with your <strong>{{ cid_count }}</strong> matched chemicals.
-        <a href="https://pubchem.ncbi.nlm.nih.gov/" target="_blank" style="color: var(--highlight);">Open PubChem</a> in Firefox to add new searches.
-    </p>
-
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-        <span class="text-dim" style="font-size: 0.85rem;">Firefox PubChem Search History:</span>
-        <button class="btn btn-secondary" style="padding: 5px 10px; font-size: 0.8rem;" onclick="refreshFirefoxHistory()">
-            Refresh
-        </button>
-    </div>
-
-    <div id="firefox-history-container" style="max-height: 350px; overflow-y: auto; margin-bottom: 20px;">
-        <table id="firefox-history-table">
-            <thead>
-                <tr>
-                    <th style="width: 30px;"></th>
-                    <th>Search Query</th>
-                    <th>Type</th>
-                    <th>Results</th>
-                    <th>Date</th>
-                    <th>Link</th>
-                </tr>
-            </thead>
-            <tbody id="firefox-history-body">
-                <tr><td colspan="6" class="text-dim" style="text-align: center; padding: 20px;">
-                    <span class="loading" style="width: 14px; height: 14px;"></span> Loading history...
-                </td></tr>
-            </tbody>
-        </table>
-    </div>
-</div>
-
-<div class="card">
-    <div class="card-header">
-        <h2>Combine Operations</h2>
-    </div>
-    <p style="margin-bottom: 15px; font-size: 0.9rem;">
-        Choose how to combine your RUG chemicals with the selected Firefox search:
-    </p>
-    <div class="actions" id="combine-actions">
-        <button class="btn btn-success" onclick="combineSelectedSearch('AND', this)" disabled id="btn-combine-and">
-            AND (Intersection)
-        </button>
-        <button class="btn btn-secondary" onclick="combineSelectedSearch('OR', this)" disabled id="btn-combine-or">
-            OR (Union)
-        </button>
-        <button class="btn btn-secondary" onclick="combineSelectedSearch('NOT', this)" disabled id="btn-combine-not">
-            NOT (Exclude)
-        </button>
-    </div>
-    <div style="margin-top: 20px; font-size: 0.85rem; color: var(--text-dim);">
-        <p><strong>AND:</strong> Shows chemicals in BOTH your RUG inventory AND the selected search. Example: "Which of my chemicals are flammable?"</p>
-        <p style="margin-top: 8px;"><strong>OR:</strong> Shows chemicals in EITHER your RUG inventory OR the selected search. Combines both lists.</p>
-        <p style="margin-top: 8px;"><strong>NOT:</strong> Shows chemicals in your RUG inventory that are NOT in the selected search. Example: "Which of my chemicals are NOT toxic?"</p>
-    </div>
-</div>
-{% endif %}
-{% endblock %}
-
-{% block scripts %}
-<script>
-let selectedCacheKey = null;
-let firefoxHistory = [];
-
-async function loadFirefoxHistory() {
-    const tbody = document.getElementById('firefox-history-body');
-    if (!tbody) return;
-
-    try {
-        const resp = await fetch('/api/firefox-pubchem-history');
-        const data = await resp.json();
-        firefoxHistory = data.history || [];
-
-        if (firefoxHistory.length === 0) {
-            tbody.innerHTML = `<tr><td colspan="6" class="text-dim" style="text-align: center; padding: 20px;">
-                No PubChem searches found in Firefox.<br>
-                <a href="https://pubchem.ncbi.nlm.nih.gov/" target="_blank" style="color: var(--highlight);">Search on PubChem</a> using Firefox, then click Refresh.
-            </td></tr>`;
-            updateCombineButtons();
-            return;
-        }
-
-        tbody.innerHTML = firefoxHistory.map((entry, idx) => `
-            <tr onclick="selectHistoryEntry('${entry.cachekey}')"
-                data-cachekey="${entry.cachekey}"
-                style="cursor: pointer;"
-                class="${idx === 0 ? 'selected' : ''}">
-                <td style="text-align: center;">
-                    <input type="radio" name="history-select" value="${entry.cachekey}" ${idx === 0 ? 'checked' : ''}
-                           onclick="event.stopPropagation(); selectHistoryEntry('${entry.cachekey}')">
-                </td>
-                <td style="max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
-                    title="${entry.name}">${entry.name}</td>
-                <td><span class="badge badge-dim">${entry.domain || entry.type || 'compound'}</span></td>
-                <td>${entry.list_size ? entry.list_size.toLocaleString() : '-'}</td>
-                <td class="mono" style="font-size: 0.8rem;">${entry.timestamp_display}</td>
-                <td><a href="${entry.url}" target="_blank" onclick="event.stopPropagation();"
-                       style="color: var(--highlight); font-size: 0.85rem;">View</a></td>
-            </tr>
-        `).join('');
-
-        // Select first entry by default
-        if (firefoxHistory.length > 0) {
-            selectedCacheKey = firefoxHistory[0].cachekey;
-        }
-        updateCombineButtons();
-
-    } catch (e) {
-        tbody.innerHTML = `<tr><td colspan="6" class="text-warning" style="text-align: center; padding: 20px;">
-            Error loading history: ${e.message}
-        </td></tr>`;
-    }
-}
-
-function selectHistoryEntry(cachekey) {
-    selectedCacheKey = cachekey;
-
-    document.querySelectorAll('#firefox-history-body tr').forEach(row => {
-        const isSelected = row.dataset.cachekey === cachekey;
-        row.classList.toggle('selected', isSelected);
-        const radio = row.querySelector('input[type="radio"]');
-        if (radio) radio.checked = isSelected;
-    });
-
-    updateCombineButtons();
-}
-
-function updateCombineButtons() {
-    const hasSelection = selectedCacheKey !== null;
-    const btnAnd = document.getElementById('btn-combine-and');
-    const btnOr = document.getElementById('btn-combine-or');
-    const btnNot = document.getElementById('btn-combine-not');
-    if (btnAnd) btnAnd.disabled = !hasSelection;
-    if (btnOr) btnOr.disabled = !hasSelection;
-    if (btnNot) btnNot.disabled = !hasSelection;
-}
-
-async function combineSelectedSearch(operation, btn) {
-    if (!selectedCacheKey) {
-        alert('Please select a search from the history first.');
-        return;
-    }
-
-    const originalText = btn.innerHTML;
-    btn.disabled = true;
-    btn.innerHTML = '<span class="loading"></span> Combining...';
-
-    try {
-        const resp = await fetch('/api/combine-pubchem/' + operation + '?cachekey=' + encodeURIComponent(selectedCacheKey), { method: 'POST' });
-        const data = await resp.json();
-
-        if (data.error) {
-            alert('Error: ' + data.error);
-        } else if (data.pubchem_url) {
-            window.open(data.pubchem_url, '_blank');
-        }
-    } catch (e) {
-        alert('Error: ' + e.message);
-    } finally {
-        btn.disabled = false;
-        btn.innerHTML = originalText;
-    }
-}
-
-async function refreshFirefoxHistory() {
-    const tbody = document.getElementById('firefox-history-body');
-    if (tbody) {
-        tbody.innerHTML = `<tr><td colspan="6" class="text-dim" style="text-align: center; padding: 20px;">
-            <span class="loading" style="width: 14px; height: 14px;"></span> Refreshing...
-        </td></tr>`;
-    }
-    selectedCacheKey = null;
-    await loadFirefoxHistory();
-}
-
-document.addEventListener('DOMContentLoaded', loadFirefoxHistory);
-</script>
-{% endblock %}
-"""
-
 # ============================================================================
 # Template rendering helper
 # ============================================================================
 
 TEMPLATES = {
     "base": BASE_TEMPLATE,
-    "index": INDEX_TEMPLATE,
-    "snapshots": SNAPSHOTS_TEMPLATE,
-    "results": RESULTS_TEMPLATE,
-    "combine": COMBINE_TEMPLATE,
+    "search": SEARCH_TEMPLATE,
+    "setup": SETUP_TEMPLATE,
 }
 
 def render(template_name, **kwargs):
@@ -935,7 +1033,42 @@ def render(template_name, **kwargs):
 
 @app.route("/")
 def index():
-    """Dashboard page."""
+    """Redirect to search (if setup complete) or setup."""
+    if is_setup_complete():
+        return redirect(url_for("search"))
+    return redirect(url_for("setup"))
+
+
+@app.route("/search")
+def search():
+    """Main search page."""
+    cache = load_cid_cache()
+
+    has_cids = False
+    cid_count = 0
+    if cache and "results" in cache:
+        cids = [r for r in cache["results"].values() if r.get("cid")]
+        has_cids = len(cids) > 0
+        cid_count = len(cids)
+
+    # Get the first search from history for the hero
+    selected_search = None
+    history = get_pubchem_history_details()
+    if history:
+        selected_search = history[0]
+
+    return render("search",
+        title="Search",
+        active_page="search",
+        has_cids=has_cids,
+        cid_count=cid_count,
+        selected_search=selected_search,
+    )
+
+
+@app.route("/setup")
+def setup():
+    """Setup/configuration page."""
     snapshots = list_snapshots()
     cache = load_cid_cache()
 
@@ -952,63 +1085,38 @@ def index():
         }
         cache_valid, _ = is_cid_cache_valid(latest_path)
 
-    return render("index",
-        title="Dashboard",
-        active_page="home",
-        snapshot_count=len(snapshots),
-        cache_stats=cache.get("stats") if cache else None,
-        cache_created=cache.get("created", "")[:19] if cache else None,
-        cache_source=Path(cache.get("source_html", "")).name if cache else None,
-        latest_snapshot=latest_snapshot,
-        cache_valid=cache_valid,
-    )
-
-
-@app.route("/snapshots")
-def snapshots():
-    """Snapshots management page."""
-    return render("snapshots",
-        title="Snapshots",
-        active_page="snapshots",
-        snapshots=list_snapshots(),
-    )
-
-
-@app.route("/results")
-def results():
-    """Results view page."""
-    cache = load_cid_cache()
-
     results_list = []
     if cache and "results" in cache:
         results_list = list(cache["results"].items())
 
-    return render("results",
-        title="Results",
-        active_page="results",
-        cache=cache,
+    return render("setup",
+        title="Setup",
+        active_page="setup",
+        snapshot_count=len(snapshots),
+        snapshots=snapshots,
+        cache_stats=cache.get("stats") if cache else None,
+        cache_created=cache.get("created", "")[:19] if cache else None,
+        latest_snapshot=latest_snapshot,
+        cache_valid=cache_valid,
+        setup_complete=is_setup_complete(),
         results=results_list,
     )
 
 
+# Legacy routes - redirect to new structure
+@app.route("/snapshots")
+def snapshots():
+    return redirect(url_for("setup"))
+
+
+@app.route("/results")
+def results():
+    return redirect(url_for("setup"))
+
+
 @app.route("/combine")
 def combine():
-    """Combine with Firefox PubChem search page."""
-    cache = load_cid_cache()
-
-    has_cids = False
-    cid_count = 0
-    if cache and "results" in cache:
-        cids = [r for r in cache["results"].values() if r.get("cid")]
-        has_cids = len(cids) > 0
-        cid_count = len(cids)
-
-    return render("combine",
-        title="Combine",
-        active_page="combine",
-        has_cids=has_cids,
-        cid_count=cid_count,
-    )
+    return redirect(url_for("search"))
 
 
 @app.route("/api/run-extraction", methods=["POST"])
@@ -1039,7 +1147,7 @@ def run_extraction():
         except Exception as e:
             return jsonify({"error": str(e)})
 
-    return jsonify({"redirect": url_for("results")})
+    return jsonify({"redirect": url_for("setup")})
 
 
 @app.route("/api/refresh-html", methods=["POST"])
@@ -1095,11 +1203,11 @@ def refresh_html_continue(session_id):
 def upload_snapshot():
     """Upload a new HTML snapshot."""
     if "file" not in request.files:
-        return redirect(url_for("snapshots"))
+        return redirect(url_for("setup"))
 
     file = request.files["file"]
     if file.filename == "":
-        return redirect(url_for("snapshots"))
+        return redirect(url_for("setup"))
 
     # Save to snapshots directory
     SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1112,7 +1220,7 @@ def upload_snapshot():
     # Update pointer to new snapshot
     update_latest_pointer(filepath)
 
-    return redirect(url_for("snapshots"))
+    return redirect(url_for("setup"))
 
 
 @app.route("/api/set-latest/<filename>", methods=["POST"])
@@ -1153,17 +1261,7 @@ def open_pubchem():
 
 @app.route("/api/combine-pubchem/<operation>", methods=["POST"])
 def combine_pubchem(operation):
-    """
-    Combine our CIDs with a selected Firefox PubChem search.
-
-    Operations:
-    - AND: Intersection (chemicals in BOTH our list AND selected search)
-    - OR: Union (chemicals in EITHER our list OR selected search)
-    - NOT: Difference (chemicals in our list but NOT in selected search)
-
-    Query params:
-    - cachekey: The PubChem cache key of the search to combine with
-    """
+    """Combine our CIDs with a selected PubChem search."""
     operation = operation.upper()
     if operation not in ("AND", "OR", "NOT"):
         return jsonify({"error": f"Invalid operation: {operation}. Use AND, OR, or NOT."})
@@ -1171,17 +1269,16 @@ def combine_pubchem(operation):
     # Get the selected cache key from query params
     user_key = request.args.get("cachekey")
     if not user_key:
-        # Fallback to latest Firefox search if no key provided
         user_key = get_latest_pubchem_history_cachekey()
         if not user_key:
             return jsonify({
-                "error": "No search selected and could not find PubChem search in Firefox."
+                "error": "No search selected. Perform a search on PubChem first."
             })
 
     # Get our CIDs
     cache = load_cid_cache()
     if not cache or "results" not in cache:
-        return jsonify({"error": "No CID results found. Run 'Look up in PubChem' first."})
+        return jsonify({"error": "No CID results found. Complete setup first."})
 
     cids = [str(r["cid"]) for r in cache["results"].values() if r.get("cid")]
     if not cids:
@@ -1201,11 +1298,18 @@ def combine_pubchem(operation):
     return jsonify({"pubchem_url": url})
 
 
-@app.route("/api/firefox-pubchem-history")
-def firefox_pubchem_history():
-    """Get all PubChem search history from Firefox localStorage."""
+@app.route("/api/pubchem-history")
+def pubchem_history():
+    """Get all PubChem search history."""
     history = get_pubchem_history_details()
     return jsonify({"history": history, "count": len(history)})
+
+
+# Legacy endpoint alias
+@app.route("/api/firefox-pubchem-history")
+def firefox_pubchem_history():
+    """Legacy alias for pubchem_history."""
+    return pubchem_history()
 
 
 @app.route("/api/download/cids")
@@ -1249,6 +1353,18 @@ def download_mapping():
     )
 
 
+@app.route("/api/quit", methods=["POST"])
+def quit_app():
+    """Quit the application."""
+    import threading
+    def shutdown():
+        import time
+        time.sleep(0.5)
+        os._exit(0)
+    threading.Thread(target=shutdown, daemon=True).start()
+    return jsonify({"status": "shutting_down"})
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -1267,7 +1383,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     url = f"http://{args.host}:{args.port}"
-    print(f"\n  Chemical Extractor Web UI")
+    print(f"\n  Chemical Search Web UI")
     print(f"  Running at: {url}\n")
 
     # Auto-open browser after a short delay (to let server start)
