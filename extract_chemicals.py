@@ -27,9 +27,23 @@ from urllib.parse import quote
 import aiohttp
 import pandas as pd
 import requests
-import snappy
 from bs4 import BeautifulSoup
 from tqdm import tqdm
+
+# Snappy decompression for Firefox localStorage (try multiple backends)
+def _snappy_decompress(data: bytes) -> bytes:
+    """Decompress snappy data using available backend."""
+    try:
+        import snappy
+        return snappy.decompress(data)
+    except ImportError:
+        pass
+    try:
+        import cramjam
+        return bytes(cramjam.snappy.decompress_raw(data))
+    except ImportError:
+        pass
+    raise ImportError("No snappy decompression available. Install python-snappy or cramjam.")
 
 CTS_API_URL = "https://cts.fiehnlab.ucdavis.edu/rest/convert/CAS/PubChem%20CID"
 
@@ -174,7 +188,7 @@ def get_latest_pubchem_history_cachekey() -> str | None:
 
         # Decompress if needed (compression_type=1 means Snappy)
         if compression_type == 1:
-            value = snappy.decompress(value)
+            value = _snappy_decompress(value)
 
         # Parse JSON
         history = json.loads(value)
@@ -236,7 +250,7 @@ def get_pubchem_history_details() -> list[dict]:
         value, compression_type = row
 
         if compression_type == 1:
-            value = snappy.decompress(value)
+            value = _snappy_decompress(value)
 
         history = json.loads(value)
         if not history:

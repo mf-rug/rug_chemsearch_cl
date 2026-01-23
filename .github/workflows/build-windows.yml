@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install beautifulsoup4 pandas requests tqdm lxml aiohttp selenium flask pyinstaller
+          pip install beautifulsoup4 pandas requests tqdm lxml aiohttp selenium flask pyinstaller cramjam
 
       - name: Build with PyInstaller
         run: pyinstaller chemical_extractor.spec --noconfirm

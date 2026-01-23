@@ -28,6 +28,9 @@ datas = [
 
 # Hidden imports that PyInstaller might miss
 hidden_imports = [
+    # Snappy decompression (for Firefox localStorage)
+    'cramjam',
+
     # Flask and web
     'flask',
     'flask.json',
@@ -90,13 +93,6 @@ hidden_imports = [
     'threading',
     'tempfile',
 ]
-
-# Try to add snappy if available
-try:
-    import snappy
-    hidden_imports.append('snappy')
-except ImportError:
-    pass
 
 a = Analysis(
     ['web_app.py'],
