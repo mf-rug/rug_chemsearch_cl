@@ -26,9 +26,17 @@ A desktop app for searching your RUG chemicals inventory against PubChem. Find w
 
 ### First-Time Setup
 
-1. **Import your database**: Click "Fetch from RUG System", log in (including MFA), then click Continue
+1. **Import your database**: Click "Fetch from RUG System", and log in.
+<img width="498" height="326" alt="image" src="https://github.com/user-attachments/assets/a19ba76c-be1e-4f13-8705-cfec0d1214c3" />
+
+Switch to department chemicals. It may require some fiddling / repetitions of login and view switching, given the instability of the page. You need to get to this view:
+
+<img width="978" height="701" alt="image" src="https://github.com/user-attachments/assets/08de3caf-9c6b-44b2-a6c3-a0b60fba3548" />
+
+Once you see this window, return to the app and click "Continue.
+
 2. **Look up in PubChem**: Click the button and wait for the lookup to complete (this can take a while the first time)
-3. **Done!** You'll be redirected to the Search page
+3. **Done!** You'll be redirected to the Search page on Pubchem.
 
 ## Using the Search
 
@@ -116,3 +124,4 @@ Use the "Quit App" button in the top-right, or use Task Manager (`Ctrl+Shift+Esc
 ## License
 
 MIT
+
