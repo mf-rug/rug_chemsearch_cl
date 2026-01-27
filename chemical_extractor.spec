@@ -31,6 +31,14 @@ hidden_imports = [
     # Snappy decompression (for Firefox localStorage)
     'cramjam',
 
+    # Chrome localStorage reader (LevelDB)
+    'ccl_chromium_reader',
+    'ccl_chromium_reader.ccl_chromium_localstorage',
+    'ccl_chromium_reader.ccl_chromium_leveldb',
+    'ccl_chromium_reader.storage_formats',
+    'ccl_chromium_reader.serialization_formats',
+    'ccl_simplesnappy',
+
     # Flask and web
     'flask',
     'flask.json',

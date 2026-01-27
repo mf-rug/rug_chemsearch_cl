@@ -30,6 +30,8 @@ from pathlib import Path
 from flask import Flask, render_template_string, jsonify, request, redirect, url_for
 
 # Import functions from the main script
+import logging
+
 from extract_chemicals import (
     DATA_DIR,
     SNAPSHOTS_DIR,
@@ -51,7 +53,16 @@ from extract_chemicals import (
     combine_pubchem_cache_keys,
     get_latest_snapshot,
     update_latest_pointer,
+    get_default_browser,
+    get_history_fingerprint,
+    save_rug_table,
+    load_rug_table,
+    fetch_cids_from_listkey,
+    save_filter_result,
+    load_filter_results,
 )
+
+logger = logging.getLogger("chemical_extractor")
 
 app = Flask(__name__)
 
@@ -347,6 +358,7 @@ BASE_TEMPLATE = """
             <h1>Chemical <span>Search</span></h1>
             <nav>
                 <a href="{{ url_for('search') }}" class="{{ 'active' if active_page == 'search' else '' }}">Search</a>
+                <a href="{{ url_for('results_page') }}" class="{{ 'active' if active_page == 'results' else '' }}">Results</a>
                 <a href="{{ url_for('setup') }}" class="{{ 'active' if active_page == 'setup' else '' }}">Setup</a>
                 <span class="nav-divider"></span>
                 <button class="btn-quit" onclick="quitApp()">Quit App</button>
@@ -444,13 +456,14 @@ SEARCH_TEMPLATE = """
         </div>
     </div>
 
+    <div id="browser-warning" class="text-warning" style="display: none; margin-bottom: 15px; padding: 10px; background: rgba(255,193,7,0.15); border-radius: 6px; font-size: 0.9rem;"></div>
     <div id="history-container" style="max-height: 350px; overflow-y: auto; margin-bottom: 20px;">
         <table id="history-table">
             <thead>
                 <tr>
                     <th style="width: 30px;"></th>
                     <th>Search Query</th>
-                    <th>Results</th>
+                    <th>Browser</th>
                     <th>When</th>
                     <th></th>
                 </tr>
@@ -514,6 +527,15 @@ async function loadHistory() {
         const data = await resp.json();
         searchHistory = data.history || [];
 
+        // Show browser warning if default browser is unsupported
+        const warningEl = document.getElementById('browser-warning');
+        if (data.browser_warning && warningEl) {
+            warningEl.textContent = data.browser_warning;
+            warningEl.style.display = 'block';
+        } else if (warningEl) {
+            warningEl.style.display = 'none';
+        }
+
         if (searchHistory.length === 0) {
             tbody.innerHTML = `<tr><td colspan="5" class="text-dim" style="text-align: center; padding: 30px;">
                 No recent PubChem searches found.<br><br>
@@ -536,10 +558,12 @@ async function loadHistory() {
                 </td>
                 <td style="max-width: 350px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
                     title="${entry.name}">${entry.name}</td>
-                <td>${entry.list_size ? entry.list_size.toLocaleString() : '-'}</td>
+                <td>${entry.browser || '?'}</td>
                 <td class="text-dim" style="font-size: 0.85rem;">${formatTime(entry.timestamp)}</td>
-                <td><a href="${entry.url}" target="_blank" onclick="event.stopPropagation();"
-                       style="color: var(--highlight); font-size: 0.85rem;">View</a></td>
+                <td style="white-space: nowrap;">
+                    <a href="${entry.url}" target="_blank" onclick="event.stopPropagation();"
+                       style="color: var(--highlight); font-size: 0.85rem;">PubChem</a>
+                </td>
             </tr>
         `).join('');
 
@@ -613,6 +637,10 @@ async function combineSelectedSearch(operation, btn) {
             alert('Error: ' + data.error);
         } else if (data.pubchem_url) {
             window.open(data.pubchem_url, '_blank');
+            if (data.filter_id) {
+                window.location.href = '/results?filter_id=' + data.filter_id;
+                return;
+            }
         }
     } catch (e) {
         alert('Error: ' + e.message);
@@ -651,31 +679,37 @@ function toggleSection(id) {
     }
 }
 
-function startAutoRefresh() {
-    const statusEl = document.getElementById('auto-refresh-status');
-    let countdown = 30;
+// --- Smart auto-refresh: poll file fingerprint every 5s, full fetch only on change ---
+let lastFingerprint = null;
+const POLL_INTERVAL_MS = 5000;
 
-    function updateStatus() {
-        if (statusEl) {
-            statusEl.textContent = `Auto-refresh in ${countdown}s`;
-        }
-    }
-
-    updateStatus();
-
-    autoRefreshInterval = setInterval(async () => {
-        countdown--;
-        if (countdown <= 0) {
-            countdown = 30;
+async function pollForChanges() {
+    try {
+        const resp = await fetch('/api/pubchem-history/check');
+        const data = await resp.json();
+        const fp = data.fingerprint;
+        if (lastFingerprint !== null && fp !== lastFingerprint) {
+            // Storage files changed — do a full refresh
+            const statusEl = document.getElementById('auto-refresh-status');
+            if (statusEl) statusEl.textContent = 'Updating...';
             await refreshHistory();
         }
-        updateStatus();
-    }, 1000);
+        lastFingerprint = fp;
+    } catch (e) {
+        // Network error — ignore, will retry next tick
+    }
+    const statusEl = document.getElementById('auto-refresh-status');
+    if (statusEl) statusEl.textContent = 'Watching for changes';
+}
+
+function startAutoRefresh() {
+    autoRefreshInterval = setInterval(pollForChanges, POLL_INTERVAL_MS);
 }
 
 document.addEventListener('DOMContentLoaded', () => {
     loadHistory();
-    startAutoRefresh();
+    // Capture initial fingerprint, then start polling
+    pollForChanges().then(() => startAutoRefresh());
 });
 
 // Cleanup on page leave
@@ -683,6 +717,87 @@ window.addEventListener('beforeunload', () => {
     if (autoRefreshInterval) clearInterval(autoRefreshInterval);
 });
 </script>
+{% endblock %}
+"""
+
+RESULTS_TEMPLATE = """
+{% extends "base" %}
+{% block content %}
+{% if not rug_table %}
+<div class="alert alert-info">
+    <p><strong>RUG table not loaded.</strong> Complete Setup first to import your chemicals and look them up in PubChem.</p>
+    <a href="{{ url_for('setup') }}" class="btn" style="margin-top: 10px;">Go to Setup</a>
+</div>
+{% elif not current_filter %}
+<div class="alert alert-info">
+    <p><strong>No results yet.</strong> Use the Search tab to combine a PubChem search with your chemicals.</p>
+    <a href="{{ url_for('search') }}" class="btn" style="margin-top: 10px;">Go to Search</a>
+</div>
+{% else %}
+<div class="card">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+        <div>
+            <h2 style="color: var(--highlight); margin-bottom: 5px;">{{ current_filter.search_name }}</h2>
+            <p class="text-dim" style="font-size: 0.85rem;">
+                Operation: <strong>{{ current_filter.operation }}</strong> &bull;
+                <span class="text-success">{{ current_filter.match_count }} matches</span> &bull;
+                {{ current_filter.created[:19] }}
+            </p>
+        </div>
+        <div style="display: flex; gap: 10px; align-items: center;">
+            {% if current_filter.pubchem_url %}
+            <a href="{{ current_filter.pubchem_url }}" target="_blank" class="btn btn-secondary" style="font-size: 0.85rem;">Open on PubChem</a>
+            {% endif %}
+        </div>
+    </div>
+
+    {% if filter_results|length > 1 %}
+    <div style="margin-bottom: 15px;">
+        <label class="text-dim" style="font-size: 0.85rem;">Switch result: </label>
+        <select onchange="if(this.value) window.location.href='/results?filter_id='+this.value;" style="font-size: 0.85rem;">
+            {% for fr in filter_results %}
+            <option value="{{ fr.id }}" {{ 'selected' if fr.id == current_filter.id else '' }}>
+                {{ fr.search_name }} ({{ fr.operation }}) — {{ fr.match_count }} matches
+            </option>
+            {% endfor %}
+        </select>
+    </div>
+    {% endif %}
+
+    {% if filtered_rows %}
+    <div style="max-height: 500px; overflow-y: auto;">
+        <table>
+            <thead>
+                <tr>
+                    {% for col in columns %}
+                    <th>{{ col }}</th>
+                    {% endfor %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in filtered_rows %}
+                <tr>
+                    {% for col in columns %}
+                    <td style="font-size: 0.85rem;">
+                        {% if col == 'CID' and row[col] %}
+                        {# Ensure CID is rendered as an integer, not a float like 7410.0 #}
+                        <a href="https://pubchem.ncbi.nlm.nih.gov/compound/{{ row[col]|int }}" target="_blank"
+                           style="color: var(--success);" class="mono">{{ row[col]|int }}</a>
+                        {% else %}
+                        {{ row[col] if row[col] is not none else '-' }}
+                        {% endif %}
+                    </td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="text-dim" style="padding: 20px; text-align: center;">No matching chemicals found in your RUG table for this search.</p>
+    {% endif %}
+</div>
+{% endif %}
 {% endblock %}
 """
 
@@ -1002,6 +1117,7 @@ function filterTable() {
 TEMPLATES = {
     "base": BASE_TEMPLATE,
     "search": SEARCH_TEMPLATE,
+    "results": RESULTS_TEMPLATE,
     "setup": SETUP_TEMPLATE,
 }
 
@@ -1110,8 +1226,53 @@ def snapshots():
 
 
 @app.route("/results")
-def results():
-    return redirect(url_for("setup"))
+def results_page():
+    """Results page showing filtered RUG table."""
+    filter_id = request.args.get("filter_id")
+    rug_table = load_rug_table()
+    filter_results = load_filter_results()
+
+    current_filter = None
+    filtered_rows = []
+    columns = []
+
+    if rug_table and filter_results:
+        # Find the requested filter (or most recent)
+        if filter_id:
+            current_filter = next((f for f in filter_results if f["id"] == filter_id), None)
+        if not current_filter:
+            current_filter = filter_results[0]
+
+        if current_filter:
+            logger.debug(
+                "Loading filter %s, %d matching CIDs",
+                current_filter["id"],
+                len(current_filter.get("matching_cids", [])),
+            )
+            matching_cid_set = set(current_filter.get("matching_cids", []))
+            columns = rug_table.get("columns", [])
+            filtered_rows = []
+            for row in rug_table.get("rows", []):
+                cid_val = row.get("CID")
+                if cid_val is None:
+                    continue
+                try:
+                    cid_int = int(cid_val)
+                except (TypeError, ValueError):
+                    # Handles NaN or other non-integer values gracefully
+                    continue
+                if cid_int in matching_cid_set:
+                    filtered_rows.append(row)
+
+    return render("results",
+        title="Results",
+        active_page="results",
+        rug_table=rug_table,
+        filter_results=filter_results,
+        current_filter=current_filter,
+        filtered_rows=filtered_rows,
+        columns=columns,
+    )
 
 
 @app.route("/combine")
@@ -1144,6 +1305,7 @@ def run_extraction():
             cas_numbers = extract_cas_numbers(df)
             pubchem_results = lookup_cas_to_cid_optimized(cas_numbers)
             save_cid_cache(html_path, compute_file_hash(html_path), pubchem_results)
+            save_rug_table(df, pubchem_results)
         except Exception as e:
             return jsonify({"error": str(e)})
 
@@ -1295,14 +1457,81 @@ def combine_pubchem(operation):
         return jsonify({"error": "Failed to combine searches in PubChem."})
 
     url = f"https://pubchem.ncbi.nlm.nih.gov/#query={combined_key}"
-    return jsonify({"pubchem_url": url})
+    result = {"pubchem_url": url}
+
+    # Fetch the actual matching CIDs from the combined listkey
+    logger.info("Fetching CIDs from combined listkey")
+    matching_cids = fetch_cids_from_listkey(combined_key)
+    if matching_cids:
+        # Look up search name from history
+        search_name = "Unknown search"
+        history = get_pubchem_history_details()
+        for entry in history:
+            if entry["cachekey"] == user_key:
+                search_name = entry["name"]
+                break
+        filter_id = save_filter_result(search_name, operation, matching_cids, url)
+        result["filter_id"] = filter_id
+    else:
+        logger.warning("CID fetch failed, returning PubChem URL only")
+
+    return jsonify(result)
+
+
+@app.route("/api/filter-results/<filter_id>/table")
+def filter_results_table(filter_id):
+    """JSON endpoint returning the filtered table data."""
+    rug_table = load_rug_table()
+    if not rug_table:
+        return jsonify({"error": "RUG table not loaded"}), 404
+
+    all_filters = load_filter_results()
+    current = next((f for f in all_filters if f["id"] == filter_id), None)
+    if not current:
+        return jsonify({"error": "Filter not found"}), 404
+
+    matching_cid_set = set(current.get("matching_cids", []))
+    columns = rug_table.get("columns", [])
+    rows = [
+        row for row in rug_table.get("rows", [])
+        if row.get("CID") is not None and int(row["CID"]) in matching_cid_set
+    ]
+
+    return jsonify({
+        "rows": rows,
+        "columns": columns,
+        "filter": {k: v for k, v in current.items() if k != "matching_cids"},
+    })
+
+
+@app.route("/api/pubchem-history/check")
+def pubchem_history_check():
+    """Lightweight endpoint: return only a fingerprint of browser storage mtimes.
+
+    The frontend polls this every few seconds and only calls the full
+    /api/pubchem-history when the fingerprint changes.
+    """
+    return jsonify({"fingerprint": get_history_fingerprint()})
 
 
 @app.route("/api/pubchem-history")
 def pubchem_history():
     """Get all PubChem search history."""
     history = get_pubchem_history_details()
-    return jsonify({"history": history, "count": len(history)})
+    default_browser = get_default_browser()
+    supported = default_browser is not None and default_browser in ("Chrome", "Firefox")
+    warning = None
+    if default_browser and not supported:
+        warning = (
+            f"Your default browser ({default_browser}) does not support "
+            "history lookup. Only Firefox and Chrome are supported."
+        )
+    return jsonify({
+        "history": history,
+        "count": len(history),
+        "default_browser": default_browser,
+        "browser_warning": warning,
+    })
 
 
 # Legacy endpoint alias
@@ -1391,7 +1620,10 @@ if __name__ == "__main__":
         def open_browser():
             import time
             time.sleep(0.5)
-            webbrowser.open(url)
+            if sys.platform == 'win32':
+                os.startfile(url)
+            else:
+                webbrowser.open(url)
         threading.Thread(target=open_browser, daemon=True).start()
 
     app.run(host=args.host, port=args.port, debug=args.debug)

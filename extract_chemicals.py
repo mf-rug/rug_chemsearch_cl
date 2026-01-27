@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import html
 import json
+import logging
 import os
 import re
 import shutil
@@ -92,11 +93,45 @@ BUNDLE_DIR = _get_bundle_dir()
 # Application directory (writable, for user data like snapshots and cache)
 APP_DIR = _get_app_dir()
 
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+logger = logging.getLogger("chemical_extractor")
+
+
+def setup_logging() -> None:
+    """Configure file + console logging for the application."""
+    if logger.handlers:
+        return  # already configured
+
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    # Always write to a log file
+    file_handler = logging.FileHandler(
+        APP_DIR / "chemical_extractor.log", encoding="utf-8"
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+
+    # Console handler (only when stdout exists)
+    if sys.stdout is not None:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(fmt)
+        logger.addHandler(console_handler)
+
+
+setup_logging()
+
 # Data directory structure (user data - writable)
 DATA_DIR = APP_DIR / "data"
 SNAPSHOTS_DIR = DATA_DIR / "snapshots"
 LATEST_POINTER = DATA_DIR / "latest.txt"  # Text file containing path to current snapshot
 CID_CACHE_FILE = DATA_DIR / "cid_cache.json"
+RUG_TABLE_FILE = DATA_DIR / "rug_table.json"
+FILTER_RESULTS_FILE = DATA_DIR / "filter_results.json"
 
 # Legacy cache configuration (for CAS→CID API lookups)
 CACHE_DIR = Path.home() / ".cache" / "cas_to_cid"
@@ -110,7 +145,7 @@ PUBCHEM_DUMP_FILE = BUNDLE_DIR / "pubchem_dump_cid_to_cas.tsv.gz"
 _pubchem_dump_cache: dict[str, int] | None = None
 
 # Global storage for active browser sessions (for web UI two-phase flow)
-_browser_sessions: dict[str, "webdriver.Chrome"] = {}
+_browser_sessions: dict[str, object] = {}
 
 # Firefox localStorage path for PubChem history (platform-specific)
 def _get_firefox_profiles_dir() -> Path:
@@ -131,6 +166,119 @@ def _get_firefox_profiles_dir() -> Path:
 
 FIREFOX_PROFILES_DIR = _get_firefox_profiles_dir()
 PUBCHEM_LOCALSTORAGE_SUBPATH = "storage/default/https+++pubchem.ncbi.nlm.nih.gov/ls/data.sqlite"
+
+
+def _get_chrome_local_storage_dir() -> Path | None:
+    """Get the Chrome Local Storage LevelDB directory for the current platform."""
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA", "")
+        if local:
+            p = Path(local) / "Google" / "Chrome" / "User Data" / "Default" / "Local Storage" / "leveldb"
+        else:
+            p = Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data" / "Default" / "Local Storage" / "leveldb"
+    elif sys.platform == "darwin":
+        p = Path.home() / "Library" / "Application Support" / "Google" / "Chrome" / "Default" / "Local Storage" / "leveldb"
+    else:
+        p = Path.home() / ".config" / "google-chrome" / "Default" / "Local Storage" / "leveldb"
+    logger.debug("Chrome Local Storage path: %s", p)
+    if p.exists():
+        logger.debug("Chrome Local Storage directory exists")
+        return p
+    logger.debug("Chrome Local Storage directory does not exist")
+    return None
+
+
+def _parse_history_entries(history: list) -> list[dict]:
+    """Parse raw PubChem history JSON into standardised entry dicts."""
+    results = []
+    for entry in history:
+        details = entry.get("details", {})
+        cache_key = details.get("cachekey")
+        if not cache_key:
+            continue
+        timestamp_ms = entry.get("timestamp", 0)
+        timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000) if timestamp_ms else None
+        results.append({
+            "name": details.get("name", "Unknown search"),
+            "cachekey": cache_key,
+            "timestamp": timestamp_dt.isoformat() if timestamp_dt else None,
+            "timestamp_display": timestamp_dt.strftime("%Y-%m-%d %H:%M:%S") if timestamp_dt else "Unknown",
+            "list_size": details.get("listsize"),
+            "type": details.get("type", "compound"),
+            "domain": details.get("domain", "compound"),
+            "url": f"https://pubchem.ncbi.nlm.nih.gov/#query={cache_key}",
+        })
+    return results
+
+
+def _get_firefox_pubchem_history() -> list[dict]:
+    """Read PubChem search history from Firefox localStorage."""
+    logger.info("Attempting to read Firefox localStorage")
+    db_path = find_firefox_pubchem_db()
+    if not db_path:
+        logger.info("Firefox PubChem localStorage DB not found")
+        return []
+
+    logger.debug("Found Firefox DB: %s", db_path)
+    temp_db = tempfile.mktemp(suffix=".sqlite")
+    try:
+        shutil.copy(db_path, temp_db)
+        conn = sqlite3.connect(temp_db)
+        cursor = conn.cursor()
+        cursor.execute("SELECT value, compression_type FROM data WHERE key='history'")
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            logger.info("No 'history' key found in Firefox localStorage")
+            return []
+
+        value, compression_type = row
+        if compression_type == 1:
+            logger.debug("Decompressing snappy-compressed value")
+            value = _snappy_decompress(value)
+
+        history = json.loads(value)
+        entries = _parse_history_entries(history) if history else []
+        logger.info("Firefox: parsed %d history entries", len(entries))
+        return entries
+    except Exception as e:
+        logger.exception("Error reading Firefox localStorage: %s", e)
+        return []
+    finally:
+        if Path(temp_db).exists():
+            Path(temp_db).unlink()
+
+
+def _get_chrome_pubchem_history() -> list[dict]:
+    """Read PubChem search history from Chrome localStorage (LevelDB)."""
+    logger.info("Attempting to read Chrome localStorage")
+    ls_dir = _get_chrome_local_storage_dir()
+    if not ls_dir:
+        logger.info("Chrome Local Storage directory not found")
+        return []
+
+    try:
+        from ccl_chromium_reader import ccl_chromium_localstorage
+    except ImportError:
+        logger.warning("ccl_chromium_reader not installed — cannot read Chrome localStorage")
+        return []
+
+    try:
+        logger.debug("Opening LevelDB at %s", ls_dir)
+        lsdb = ccl_chromium_localstorage.LocalStoreDb(ls_dir)
+        for record in lsdb.iter_records_for_storage_key("https://pubchem.ncbi.nlm.nih.gov"):
+            logger.debug("Record: storage_key=%s  script_key=%s", record.storage_key, record.script_key)
+            if record.script_key == "history":
+                history = json.loads(record.value)
+                entries = _parse_history_entries(history) if history else []
+                logger.info("Chrome: found 'history' key with %d entries", len(entries))
+                return entries
+        logger.info("Chrome: no 'history' key found for pubchem.ncbi.nlm.nih.gov")
+        return []
+    except Exception as e:
+        logger.exception("Error reading Chrome localStorage: %s", e)
+        return []
 
 
 def find_firefox_pubchem_db() -> Path | None:
@@ -164,139 +312,176 @@ def find_firefox_pubchem_db() -> Path | None:
     return candidates[0] if candidates else None
 
 
+def get_history_fingerprint() -> str:
+    """Return a cheap fingerprint based on browser storage file mtimes.
+
+    For Firefox the localStorage file is site-specific (only changes when
+    PubChem writes to it).  For Chrome the LevelDB dir is shared across all
+    sites, so its mtime changes frequently — we still include it so Chrome-
+    only users get updates, but it will cause more frequent (harmless) full
+    fetches.
+    """
+    parts: list[str] = []
+
+    # Firefox: site-specific sqlite file
+    ff_db = find_firefox_pubchem_db()
+    if ff_db:
+        try:
+            parts.append(f"ff:{ff_db.stat().st_mtime_ns}")
+        except OSError:
+            parts.append("ff:err")
+    else:
+        parts.append("ff:none")
+
+    # Chrome: shared LevelDB directory
+    chrome_dir = _get_chrome_local_storage_dir()
+    if chrome_dir:
+        try:
+            parts.append(f"cr:{chrome_dir.stat().st_mtime_ns}")
+        except OSError:
+            parts.append("cr:err")
+    else:
+        parts.append("cr:none")
+
+    return "|".join(parts)
+
+
 def get_latest_pubchem_history_cachekey() -> str | None:
     """
-    Read Firefox localStorage to get the latest PubChem search cache key.
+    Get the latest PubChem search cache key from browser history (Firefox + Chrome).
 
     Returns:
         The cache key of the most recent PubChem search, or None if not found.
     """
-    db_path = find_firefox_pubchem_db()
-    if not db_path:
-        print("Warning: Firefox PubChem localStorage not found")
+    history = get_pubchem_history_details()
+    if not history:
+        print("Warning: No PubChem history found in any browser")
         return None
 
-    # Copy DB to temp file to avoid lock issues
-    temp_db = tempfile.mktemp(suffix=".sqlite")
-    try:
-        shutil.copy(db_path, temp_db)
-        conn = sqlite3.connect(temp_db)
-        cursor = conn.cursor()
-
-        # Get the history entry
-        cursor.execute("SELECT value, compression_type FROM data WHERE key='history'")
-        row = cursor.fetchone()
-        conn.close()
-
-        if not row:
-            print("Warning: No PubChem history found in Firefox localStorage")
-            return None
-
-        value, compression_type = row
-
-        # Decompress if needed (compression_type=1 means Snappy)
-        if compression_type == 1:
-            value = _snappy_decompress(value)
-
-        # Parse JSON
-        history = json.loads(value)
-        if not history:
-            print("Warning: PubChem history is empty")
-            return None
-
-        # Find entry with latest timestamp
-        latest = max(history, key=lambda x: x.get("timestamp", 0))
-        cache_key = latest.get("details", {}).get("cachekey")
-
-        if cache_key:
-            name = latest.get("details", {}).get("name", "Unknown")
-            print(f"Found latest PubChem search: '{name}' (key: {cache_key[:20]}...)")
-            return cache_key
-
-        print("Warning: Latest PubChem history entry has no cache key")
-        return None
-
-    except Exception as e:
-        print(f"Error reading Firefox localStorage: {e}")
-        return None
-    finally:
-        if Path(temp_db).exists():
-            Path(temp_db).unlink()
+    cache_key = history[0]["cachekey"]
+    name = history[0]["name"]
+    print(f"Found latest PubChem search: '{name}' (key: {cache_key[:20]}...)")
+    return cache_key
 
 
 def get_pubchem_history_details() -> list[dict]:
     """
-    Read Firefox localStorage to get all PubChem search history.
+    Read PubChem search history from all supported browsers (Firefox + Chrome).
 
     Returns:
-        List of dicts sorted by timestamp (newest first), each with:
-        - name: search query/name
-        - cachekey: PubChem cache key for the search
-        - timestamp: ISO format timestamp
-        - timestamp_display: Human readable timestamp
-        - list_size: Number of compounds in results
-        - type: Type of search (e.g., "compound", "substance")
-        - url: Direct URL to view this search on PubChem
+        List of dicts sorted by timestamp (newest first), deduplicated by cachekey.
     """
-    db_path = find_firefox_pubchem_db()
-    if not db_path:
-        return []
+    firefox_history = _get_firefox_pubchem_history()
+    for entry in firefox_history:
+        entry["browser"] = "Firefox"
+    chrome_history = _get_chrome_pubchem_history()
+    for entry in chrome_history:
+        entry["browser"] = "Chrome"
 
-    temp_db = tempfile.mktemp(suffix=".sqlite")
+    logger.info("History counts — Firefox: %d, Chrome: %d", len(firefox_history), len(chrome_history))
+
+    # Merge and deduplicate by cachekey (keep newest)
+    seen: dict[str, dict] = {}
+    for entry in firefox_history + chrome_history:
+        key = entry["cachekey"]
+        if key not in seen or (entry["timestamp"] or "") > (seen[key]["timestamp"] or ""):
+            seen[key] = entry
+
+    results = list(seen.values())
+    results.sort(key=lambda x: x["timestamp"] or "", reverse=True)
+    logger.info("Merged/deduplicated history: %d entries", len(results))
+    return results
+
+
+def get_default_browser() -> str | None:
+    """Return the name of the user's default browser, or None if unknown."""
     try:
-        shutil.copy(db_path, temp_db)
-        conn = sqlite3.connect(temp_db)
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT value, compression_type FROM data WHERE key='history'")
-        row = cursor.fetchone()
-        conn.close()
-
-        if not row:
-            return []
-
-        value, compression_type = row
-
-        if compression_type == 1:
-            value = _snappy_decompress(value)
-
-        history = json.loads(value)
-        if not history:
-            return []
-
-        results = []
-        for entry in history:
-            details = entry.get("details", {})
-            cache_key = details.get("cachekey")
-
-            if not cache_key:
-                continue
-
-            # Convert timestamp (milliseconds) to datetime
-            timestamp_ms = entry.get("timestamp", 0)
-            timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000) if timestamp_ms else None
-
-            results.append({
-                "name": details.get("name", "Unknown search"),
-                "cachekey": cache_key,
-                "timestamp": timestamp_dt.isoformat() if timestamp_dt else None,
-                "timestamp_display": timestamp_dt.strftime("%Y-%m-%d %H:%M:%S") if timestamp_dt else "Unknown",
-                "list_size": details.get("listsize"),
-                "type": details.get("type", "compound"),
-                "domain": details.get("domain", "compound"),
-                "url": f"https://pubchem.ncbi.nlm.nih.gov/#query={cache_key}",
-            })
-
-        # Sort by timestamp, newest first
-        results.sort(key=lambda x: x["timestamp"] or "", reverse=True)
-        return results
-
-    except Exception as e:
-        print(f"Error reading Firefox localStorage: {e}")
-        return []
-    finally:
-        if Path(temp_db).exists():
-            Path(temp_db).unlink()
+        if sys.platform == "darwin":
+            import subprocess
+            result = subprocess.run(
+                ["defaults", "read",
+                 "com.apple.LaunchServices/com.apple.launchservices.secure",
+                 "LSHandlers"],
+                capture_output=True, text=True,
+            )
+            # Fallback: read the http handler via shell
+            result2 = subprocess.run(
+                ["defaults", "read",
+                 "~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure",
+                 "LSHandlers"],
+                capture_output=True, text=True,
+            )
+            # More reliable approach on macOS
+            from urllib.request import urlopen  # noqa: F811
+            import plistlib
+            result3 = subprocess.run(
+                ["plutil", "-convert", "xml1", "-o", "-",
+                 os.path.expanduser(
+                     "~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist"
+                 )],
+                capture_output=True,
+            )
+            if result3.returncode == 0:
+                plist = plistlib.loads(result3.stdout)
+                for handler in plist.get("LSHandlers", []):
+                    scheme = handler.get("LSHandlerURLScheme", "")
+                    if scheme in ("http", "https"):
+                        bundle_id = handler.get("LSHandlerRoleAll", "").lower()
+                        if "chrome" in bundle_id:
+                            return "Chrome"
+                        elif "firefox" in bundle_id:
+                            return "Firefox"
+                        elif "safari" in bundle_id:
+                            return "Safari"
+                        elif "brave" in bundle_id:
+                            return "Brave"
+                        elif "opera" in bundle_id:
+                            return "Opera"
+                        elif "edge" in bundle_id:
+                            return "Edge"
+                        else:
+                            return bundle_id
+        elif sys.platform == "win32":
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice",
+            ) as key:
+                prog_id = winreg.QueryValueEx(key, "ProgId")[0].lower()
+                if "chrome" in prog_id:
+                    return "Chrome"
+                elif "firefox" in prog_id:
+                    return "Firefox"
+                elif "edge" in prog_id:
+                    return "Edge"
+                elif "brave" in prog_id:
+                    return "Brave"
+                elif "opera" in prog_id:
+                    return "Opera"
+                else:
+                    return prog_id
+        else:
+            # Linux: check xdg-settings
+            import subprocess
+            result = subprocess.run(
+                ["xdg-settings", "get", "default-web-browser"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                browser = result.stdout.strip().lower()
+                if "chrome" in browser or "chromium" in browser:
+                    return "Chrome"
+                elif "firefox" in browser:
+                    return "Firefox"
+                elif "brave" in browser:
+                    return "Brave"
+                elif "opera" in browser:
+                    return "Opera"
+                else:
+                    return result.stdout.strip()
+    except Exception:
+        logger.debug("Could not detect default browser", exc_info=True)
+    return None
 
 
 def combine_pubchem_cache_keys(key1: str, key2: str, operation: str = "AND") -> str | None:
@@ -1371,6 +1556,257 @@ def open_pubchem_search(pubchem_results: dict[str, dict], cids_file: Path, force
     print(f"\nCould not upload to PubChem cache. CIDs saved to: {cids_file}")
     print("Use --force-browser to try the long URL anyway.")
     return False
+
+
+def save_rug_table(df: pd.DataFrame, cid_results: dict[str, dict]) -> None:
+    """Save the full RUG table with CID column as JSON for later filtering."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    table_df = df.copy()
+    table_df["CID"] = table_df["Casnr"].map(
+        lambda cas: cid_results.get(cas, {}).get("cid")
+    )
+    data = {
+        "created": datetime.now().isoformat(),
+        "columns": list(table_df.columns),
+        "rows": table_df.to_dict(orient="records"),
+    }
+    RUG_TABLE_FILE.write_text(json.dumps(data, indent=2, default=str))
+    logger.info("Saved RUG table: %d rows, %d columns", len(table_df), len(table_df.columns))
+
+
+def load_rug_table() -> dict | None:
+    """Load the RUG table from disk."""
+    if not RUG_TABLE_FILE.exists():
+        return None
+    try:
+        return json.loads(RUG_TABLE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def fetch_cids_from_listkey(cache_key: str) -> list[int] | None:
+    """
+    Fetch the actual CID list from a PubChem *cache_key* using the SDQ endpoint.
+
+    This mirrors what the web UI does when you download results for a search
+    identified by a cache_key (see network call to sdq/sphinxql.cgi).
+
+    Returns list of CID ints, or None on total failure.
+    """
+    url = "https://pubchem.ncbi.nlm.nih.gov/sdq/sphinxql.cgi"
+
+    query = {
+        "download": "*",
+        "collection": "compound",
+        "order": ["relevancescore,desc"],
+        "start": 1,
+        "limit": 10_000_000,
+        "downloadfilename": f"PubChem_compound_CID_{cache_key}",
+        "where": {
+            "ands": [
+                {
+                    "input": {
+                        "type": "netcachekey",
+                        "idtype": "cid",
+                        "key": cache_key,
+                    }
+                }
+            ]
+        },
+    }
+
+    params = {
+        "infmt": "json",
+        "outfmt": "json",
+        "query": json.dumps(query),
+    }
+
+    logger.info(
+        "Starting CID fetch from cache_key %s... via SDQ",
+        cache_key[:20] + ("..." if len(cache_key) > 20 else ""),
+    )
+
+    def _extract_cids_from_sdq_payload(payload) -> list[int]:
+        """
+        SDQ can return a few shapes. We try the common ones:
+        - dict with "result": [ {"cid": ...}, ... ]
+        - dict with "result": [ ["cid"], ["123"], ... ] (table with header)
+        - dict with "result": [ ["123", ...], ... ] (table without header)
+        - top-level list containing one of the above dicts
+        - top-level list of dicts each having a "cid" field
+        """
+        if isinstance(payload, list):
+            # Case 0: top-level list of dict rows with "cid"
+            if payload and isinstance(payload[0], dict) and "cid" in payload[0]:
+                cids: list[int] = []
+                for row in payload:
+                    if not isinstance(row, dict):
+                        continue
+                    cid = row.get("cid")
+                    if cid is None:
+                        continue
+                    try:
+                        cids.append(int(cid))
+                    except (TypeError, ValueError):
+                        continue
+                return cids
+
+            # Otherwise: sometimes the response is a list of sections; pick the first dict-like item
+            for item in payload:
+                if isinstance(item, dict):
+                    return _extract_cids_from_sdq_payload(item)
+            return []
+
+        if not isinstance(payload, dict):
+            return []
+
+        rows = payload.get("result") or payload.get("Result") or []
+        if not isinstance(rows, list):
+            return []
+
+        cids: list[int] = []
+        if not rows:
+            return cids
+
+        # Case A: list of dicts
+        if isinstance(rows[0], dict):
+            for row in rows:
+                cid = row.get("cid") if isinstance(row, dict) else None
+                if cid is None:
+                    continue
+                try:
+                    cids.append(int(cid))
+                except (TypeError, ValueError):
+                    continue
+            return cids
+
+        # Case B/C: list of lists
+        if isinstance(rows[0], list):
+            # Header detection: first row contains "cid"
+            header = rows[0]
+            cid_idx = None
+            if all(isinstance(x, str) for x in header):
+                for i, col in enumerate(header):
+                    if str(col).strip().lower() == "cid":
+                        cid_idx = i
+                        break
+
+            start_i = 1 if cid_idx is not None else 0
+            for row in rows[start_i:]:
+                if not isinstance(row, list) or not row:
+                    continue
+                val = row[cid_idx] if cid_idx is not None and cid_idx < len(row) else row[0]
+                try:
+                    cids.append(int(val))
+                except (TypeError, ValueError):
+                    continue
+            return cids
+
+        return cids
+
+    try:
+        resp = requests.get(url, params=params, timeout=120)
+
+        if resp.status_code != 200:
+            body_snippet = ""
+            try:
+                text = resp.text or ""
+                body_snippet = text[:500].replace("\n", " ")
+            except Exception:
+                body_snippet = "<unable to read response body>"
+
+            logger.error(
+                "SDQ fetch HTTP %d for cache_key %s... (url=%s, body_snippet=%r)",
+                resp.status_code,
+                cache_key[:20],
+                resp.url,
+                body_snippet,
+            )
+            return None
+
+        data = resp.json()
+        cids = _extract_cids_from_sdq_payload(data)
+
+        if not cids:
+            # High-signal debug to understand why we got 0 CIDs for a key that should have results.
+            try:
+                payload_type = type(data).__name__
+                keys = list(data.keys()) if isinstance(data, dict) else None
+                result_len = None
+                header = None
+                if isinstance(data, dict):
+                    rows = data.get("result") or data.get("Result") or None
+                    if isinstance(rows, list):
+                        result_len = len(rows)
+                        if rows and isinstance(rows[0], list):
+                            header = rows[0][:20]
+                logger.warning(
+                    "SDQ returned 0 CIDs for cache_key %s... (payload_type=%s, keys=%s, result_len=%s, header=%r, url=%s)",
+                    cache_key[:20],
+                    payload_type,
+                    keys,
+                    result_len,
+                    header,
+                    resp.url,
+                )
+                snippet = json.dumps(data, ensure_ascii=False)[:2000].replace("\n", " ")
+                logger.debug("SDQ payload snippet (first 2000 chars): %s", snippet)
+            except Exception:
+                logger.debug("Failed to log SDQ debug payload details", exc_info=True)
+
+        logger.info(
+            "Fetched %d CIDs from cache_key %s...",
+            len(cids),
+            cache_key[:20],
+        )
+        return cids or None
+
+    except Exception as e:
+        # Log response shape hints if we got a response
+        try:
+            body_snippet = (resp.text or "")[:500].replace("\n", " ")
+            logger.error(
+                "Error fetching CIDs from cache_key %s...: %s (http_status=%s, body_snippet=%r)",
+                cache_key[:20],
+                e,
+                getattr(resp, "status_code", None),
+                body_snippet,
+            )
+        except Exception:
+            logger.error("Error fetching CIDs from cache_key %s...: %s", cache_key[:20], e)
+        return None
+
+
+def save_filter_result(search_name: str, operation: str, matching_cids: list[int], pubchem_url: str = "") -> str:
+    """Save a filter result and return its short ID."""
+    filter_id = str(uuid.uuid4())[:8]
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    results = load_filter_results()
+    results.insert(0, {
+        "id": filter_id,
+        "search_name": search_name,
+        "operation": operation,
+        "matching_cids": matching_cids,
+        "match_count": len(matching_cids),
+        "pubchem_url": pubchem_url,
+        "created": datetime.now().isoformat(),
+    })
+    # Keep last 10
+    results = results[:10]
+    FILTER_RESULTS_FILE.write_text(json.dumps(results, indent=2))
+    logger.info("Saved filter: '%s' (%s) → %d matches", search_name, operation, len(matching_cids))
+    return filter_id
+
+
+def load_filter_results() -> list[dict]:
+    """Load saved filter results."""
+    if not FILTER_RESULTS_FILE.exists():
+        return []
+    try:
+        return json.loads(FILTER_RESULTS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
 
 
 def main():

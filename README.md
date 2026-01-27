@@ -36,15 +36,15 @@ Switch to department chemicals. It may require some fiddling / repetitions of lo
 Once you see this window, return to the app and click "Continue.
 
 2. **Look up in PubChem**: Click the button and wait for the lookup to complete (this can take a while the first time)
-3. **Done!** You'll be redirected to the Search page on Pubchem.
+3. **Done!** You'll be redirected to the Search page. A Results tab shows a filtered table of your RUG chemicals that matched
 
 ## Using the Search
 
 1. Go to [PubChem](https://pubchem.ncbi.nlm.nih.gov/) and search for anything (structures, properties, keywords)
 2. Come back to Chemical Search - your search appears in the list automatically
-3. Click **"Find in My Chemicals (AND)"** to see which of your chemicals match
+3. Click **"Find in My Chemicals (AND)"** to see which of your chemicals match. After combining, the app navigates to a Results tab showing your RUG chemicals that matched
 
-The search list auto-refreshes every 30 seconds, so just search on PubChem and switch back.
+The search list watches for changes automatically, so just search on PubChem and switch back.
 
 ### Search Operations
 
@@ -62,7 +62,7 @@ The app uses a multi-layer lookup strategy for CAS → PubChem CID mapping:
 3. **CTS API** - Chemical Translation Service (batch, fast)
 4. **PubChem API** - direct lookup (rate-limited fallback)
 
-Search history is read from Firefox's localStorage for PubChem, allowing seamless integration with your browser searches.
+Search history is read from Firefox's or Chrome's localStorage for PubChem, allowing seamless integration with your browser searches.
 
 ### Data Storage
 
@@ -70,7 +70,9 @@ All data is stored next to the executable:
 - `data/snapshots/` - HTML exports from RUG
 - `data/cid_cache.json` - PubChem lookup results
 - `data/latest.txt` - pointer to current snapshot
-- `chemical_extractor.log` - debug log (Windows only)
+- `data/rug_table.json` - parsed chemicals table
+- `data/filter_results.json` - filtered search results
+- `chemical_extractor.log` - debug log
 
 ### Building from Source
 
@@ -95,7 +97,7 @@ The built app will be in `dist/ChemicalExtractor/`.
 ### Requirements
 
 - Python 3.10+
-- Firefox (for PubChem search history integration)
+- Firefox or Chrome (for PubChem search history integration)
 - Chrome + ChromeDriver (for RUG database fetching)
 
 ### Dependencies
@@ -106,6 +108,7 @@ The built app will be in `dist/ChemicalExtractor/`.
 - aiohttp - async HTTP requests
 - selenium - browser automation
 - cramjam - snappy decompression for Firefox localStorage
+- ccl_chromium_reader - Chrome localStorage reading
 
 ## Troubleshooting
 
@@ -115,7 +118,7 @@ The first lookup loads a 4M-line gzipped file which can take 30+ seconds. Check 
 
 ### "No PubChem searches found"
 
-Make sure you're using Firefox to search on PubChem. The app reads search history from Firefox's localStorage.
+Make sure you're using Firefox or Chrome to search on PubChem. The app reads search history from the browser's localStorage.
 
 ### Can't close the app on Windows
 
