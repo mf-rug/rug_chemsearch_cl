@@ -132,6 +132,9 @@ LATEST_POINTER = DATA_DIR / "latest.txt"  # Text file containing path to current
 CID_CACHE_FILE = DATA_DIR / "cid_cache.json"
 RUG_TABLE_FILE = DATA_DIR / "rug_table.json"
 FILTER_RESULTS_FILE = DATA_DIR / "filter_results.json"
+COMPOUND_INFO_FILE = DATA_DIR / "compound_info.json"
+APP_SEARCHES_FILE = DATA_DIR / "app_searches.json"
+STALE_SEARCHES_FILE = DATA_DIR / "stale_searches.json"
 
 # Legacy cache configuration (for CAS→CID API lookups)
 CACHE_DIR = Path.home() / ".cache" / "cas_to_cid"
@@ -866,6 +869,193 @@ def _format_results(cid_map: dict[str, int | None]) -> dict[str, dict]:
             results[cas] = {"status": "found", "cid": cid}
         else:
             results[cas] = {"status": "not_found", "cid": None}
+    return results
+
+
+async def repair_entry_by_text_search(
+    entry_name: str,
+    cas_number: str,
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore
+) -> dict | None:
+    """
+    Attempt to find CID by searching PubChem with the entry name.
+
+    Args:
+        entry_name: Chemical name from RUG table
+        cas_number: Original CAS (for tracking)
+        session: aiohttp session
+        semaphore: Rate limiting semaphore
+
+    Returns:
+        {
+            "cid": int,
+            "repair_source": "text_search:{query}",
+            "repair_timestamp": "2024-01-27T..."
+        } or None if no match
+    """
+    if not entry_name or entry_name == "-":
+        return None
+
+    # Clean entry name for URL
+    query = entry_name.strip()
+    import urllib.parse
+    url = f"{PUBCHEM_BASE_URL}/compound/name/{urllib.parse.quote(query)}/cids/JSON"
+
+    async with semaphore:
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 404:
+                    logger.info(f"Text search no match: {entry_name}")
+                    return None
+
+                resp.raise_for_status()
+                data = await resp.json()
+                cids = data.get("IdentifierList", {}).get("CID", [])
+
+                if cids:
+                    best_match_cid = cids[0]  # First = best match
+                    logger.info(f"Text search match: {entry_name} → CID {best_match_cid}")
+                    return {
+                        "cid": best_match_cid,
+                        "repair_source": f"text_search:{query}",
+                        "repair_timestamp": datetime.now().isoformat()
+                    }
+                return None
+
+        except Exception as e:
+            logger.warning(f"Text search error for '{entry_name}': {e}")
+            return None
+        finally:
+            # Rate limiting delay
+            await asyncio.sleep(0.25)
+
+
+async def repair_unmatched_entries(
+    progress_callback=None,
+    review_mode=False,
+    skip_repaired=True
+) -> dict:
+    """
+    Repair unmatched entries by searching PubChem with entry names.
+
+    Args:
+        progress_callback: Optional callback(processed, total, current_name)
+        review_mode: If True, don't save repairs (return for review instead)
+        skip_repaired: If True, skip entries already successfully repaired
+
+    Returns:
+        {
+            "total_attempts": int,
+            "successful_repairs": int,
+            "failed_repairs": int,
+            "skipped": int,
+            "repaired_entries": [{"cas": str, "name": str, "cid": int}, ...]
+        }
+    """
+    # Load current data
+    rug_table = load_rug_table()
+    cid_cache = load_cid_cache()
+
+    if not rug_table or not cid_cache:
+        logger.error("Cannot repair: missing RUG table or CID cache")
+        return {"error": "Missing data"}
+
+    # Find unmatched entries
+    unmatched = []
+    for row in rug_table.get("rows", []):
+        cid_val = row.get("CID")
+        # Check for None or NaN
+        if cid_val is None or (isinstance(cid_val, float) and cid_val != cid_val):
+            cas = row.get("Casnr", "")
+            name = row.get("Name", "")
+
+            # Skip if already repaired and skip_repaired=True
+            if skip_repaired and cas:
+                cache_entry = cid_cache.get("results", {}).get(cas, {})
+                if cache_entry.get("status") == "repaired":
+                    continue  # Already successfully repaired
+
+            if name and name != "-":
+                unmatched.append({"cas": cas, "name": name, "row": row})
+
+    total = len(unmatched)
+    logger.info(f"Starting repair for {total} unmatched entries (review_mode={review_mode})")
+
+    # Process entries 1-by-1 with text search
+    results = {
+        "total_attempts": total,
+        "successful_repairs": 0,
+        "failed_repairs": 0,
+        "skipped": 0,
+        "repaired_entries": [],
+        "review_mode": review_mode
+    }
+
+    async with aiohttp.ClientSession() as session:
+        semaphore = asyncio.Semaphore(5)  # 5 concurrent max (PubChem limit)
+
+        for idx, entry in enumerate(unmatched):
+            if progress_callback:
+                progress_callback(idx + 1, total, entry["name"])
+
+            # Attempt text search repair
+            repair_result = await repair_entry_by_text_search(
+                entry["name"],
+                entry["cas"],
+                session,
+                semaphore
+            )
+
+            # Store repair result
+            cas = entry["cas"]
+            if repair_result:
+                # Success: collect for results
+                results["successful_repairs"] += 1
+                results["repaired_entries"].append({
+                    "cas": cas,
+                    "name": entry["name"],
+                    "cid": repair_result["cid"],
+                    "repair_source": repair_result["repair_source"]
+                })
+
+                # Update cache immediately if not in review mode
+                if not review_mode and cas and cas in cid_cache.get("results", {}):
+                    cache_entry = cid_cache["results"][cas]
+                    cache_entry["repair_attempted"] = True
+                    cache_entry["status"] = "repaired"
+                    cache_entry["cid"] = repair_result["cid"]
+                    cache_entry["repair_source"] = repair_result["repair_source"]
+                    cache_entry["repair_timestamp"] = repair_result["repair_timestamp"]
+            else:
+                # Failed: mark as attempted (only if not review mode)
+                results["failed_repairs"] += 1
+                if not review_mode and cas and cas in cid_cache.get("results", {}):
+                    cache_entry = cid_cache["results"][cas]
+                    cache_entry["repair_attempted"] = True
+
+            # Save progress every 10 entries (only in auto-accept mode)
+            if not review_mode and (idx + 1) % 10 == 0:
+                save_cid_cache(
+                    cid_cache["source_html"],
+                    cid_cache["source_hash"],
+                    cid_cache["results"]
+                )
+                logger.info(f"Repair progress saved: {idx + 1}/{total}")
+
+    # Final save (only in auto-accept mode)
+    if not review_mode:
+        save_cid_cache(
+            cid_cache["source_html"],
+            cid_cache["source_hash"],
+            cid_cache["results"]
+        )
+
+        # Rebuild RUG table with repaired CIDs
+        original_df = parse_html_table(Path(cid_cache["source_html"]))
+        save_rug_table(original_df, cid_cache["results"])
+
+    logger.info(f"Repair complete: {results['successful_repairs']} repaired, {results['failed_repairs']} failed")
     return results
 
 
@@ -1807,6 +1997,217 @@ def load_filter_results() -> list[dict]:
         return json.loads(FILTER_RESULTS_FILE.read_text())
     except (json.JSONDecodeError, OSError):
         return []
+
+
+def load_app_searches() -> set[str]:
+    """Load app-generated cache keys from disk."""
+    if not APP_SEARCHES_FILE.exists():
+        return set()
+    try:
+        data = json.loads(APP_SEARCHES_FILE.read_text())
+        return set(data.get("cache_keys", []))
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+
+def save_app_search(cache_key: str) -> None:
+    """Record a cache key as app-generated."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    app_searches = load_app_searches()
+    app_searches.add(cache_key)
+    # Keep last 50 to avoid unbounded growth
+    app_searches_list = list(app_searches)[-50:]
+    data = {
+        "version": 1,
+        "cache_keys": app_searches_list,
+    }
+    APP_SEARCHES_FILE.write_text(json.dumps(data, indent=2))
+    logger.info("Recorded app-generated search: %s", cache_key[:20])
+
+
+def load_stale_searches() -> set[str]:
+    """Load blacklisted stale cache keys from disk."""
+    if not STALE_SEARCHES_FILE.exists():
+        return set()
+    try:
+        data = json.loads(STALE_SEARCHES_FILE.read_text())
+        return set(data.get("cache_keys", []))
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+
+def mark_search_as_stale(cache_key: str) -> None:
+    """Blacklist a cache key as stale/expired."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    stale = load_stale_searches()
+    stale.add(cache_key)
+    # Keep last 100 to avoid unbounded growth
+    stale_list = list(stale)[-100:]
+    data = {"version": 1, "cache_keys": stale_list}
+    STALE_SEARCHES_FILE.write_text(json.dumps(data, indent=2))
+    logger.info("Blacklisted stale search: %s", cache_key[:20])
+
+
+def load_compound_info() -> dict:
+    """Load compound info cache from disk."""
+    if not COMPOUND_INFO_FILE.exists():
+        return {"version": 1, "compounds": {}}
+    try:
+        data = json.loads(COMPOUND_INFO_FILE.read_text())
+        if "compounds" not in data:
+            return {"version": 1, "compounds": {}}
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {"version": 1, "compounds": {}}
+
+
+def save_compound_info(data: dict) -> None:
+    """Save compound info cache to disk."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    COMPOUND_INFO_FILE.write_text(json.dumps(data, indent=2))
+
+
+async def _fetch_bulk_properties(
+    session: aiohttp.ClientSession,
+    cids: list[int],
+    semaphore: asyncio.Semaphore,
+) -> list[dict]:
+    """Fetch properties for a chunk of CIDs via PUG REST (max 200)."""
+    url = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/property/CanonicalSMILES,MolecularFormula,MolecularWeight,IUPACName,Title/JSON"
+    cid_str = ",".join(str(c) for c in cids)
+    async with semaphore:
+        try:
+            async with session.post(
+                url,
+                data={"cid": cid_str},
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("PropertyTable", {}).get("Properties", [])
+                else:
+                    logger.warning("Bulk properties HTTP %d for %d CIDs", resp.status, len(cids))
+                    return []
+        except Exception as e:
+            logger.warning("Bulk properties error: %s", e)
+            return []
+
+
+async def _fetch_ghs_for_cid(
+    session: aiohttp.ClientSession,
+    cid: int,
+    semaphore: asyncio.Semaphore,
+) -> tuple[int, list[str]]:
+    """Fetch GHS pictogram codes for a single CID via PUG View."""
+    url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/{cid}/JSON/?heading=GHS+Classification"
+    async with semaphore:
+        try:
+            await asyncio.sleep(1.0)  # rate limit: 5 concurrent × 1s = 5 req/sec
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pictograms = _extract_ghs_pictograms(data)
+                    return (cid, pictograms)
+                logger.debug("GHS fetch HTTP %d for CID %d", resp.status, cid)
+                return (cid, [])
+        except Exception:
+            return (cid, [])
+
+
+def _extract_ghs_pictograms(data: dict) -> list[str]:
+    """Extract GHS pictogram codes from PUG View JSON response."""
+    codes = set()
+    try:
+        sections = data.get("Record", {}).get("Section", [])
+        _walk_sections_for_pictograms(sections, codes)
+    except Exception:
+        pass
+    return sorted(codes)
+
+
+def _walk_sections_for_pictograms(sections: list, codes: set) -> None:
+    """Recursively walk PUG View sections to find pictogram URLs."""
+    for section in sections:
+        if "Section" in section:
+            _walk_sections_for_pictograms(section["Section"], codes)
+        for info in section.get("Information", []):
+            value = info.get("Value", {})
+            for markup in value.get("StringWithMarkup", []):
+                for m in markup.get("Markup", []):
+                    url = m.get("URL", "")
+                    # e.g. https://pubchem.ncbi.nlm.nih.gov/images/ghs/GHS07.svg
+                    match = re.search(r"(GHS\d{2})", url)
+                    if match:
+                        codes.add(match.group(1))
+
+
+async def fetch_compound_properties(
+    cids: list[int],
+    existing_info: dict,
+    progress_cb=None,
+) -> dict:
+    """
+    Fetch compound properties and GHS data from PubChem for the given CIDs.
+
+    Args:
+        cids: List of CID integers to fetch
+        existing_info: Existing compound info dict (compounds section)
+        progress_cb: Optional callback(fetched_count, total_count)
+
+    Returns:
+        Dict mapping CID string to compound info dict
+    """
+    result = dict(existing_info)
+    cids_need_props = [c for c in cids if str(c) not in result]
+    cids_need_ghs = [c for c in cids if str(c) not in result or "ghs_pictograms" not in result.get(str(c), {})]
+
+    total = len(cids_need_props) + len(cids_need_ghs)
+    fetched = 0
+
+    if progress_cb:
+        progress_cb(fetched, total)
+
+    semaphore = asyncio.Semaphore(5)
+
+    async with aiohttp.ClientSession() as session:
+        # Phase A: Bulk properties in chunks of 200
+        for i in range(0, len(cids_need_props), 200):
+            chunk = cids_need_props[i : i + 200]
+            props_list = await _fetch_bulk_properties(session, chunk, semaphore)
+            for prop in props_list:
+                cid_key = str(prop.get("CID", ""))
+                if not cid_key:
+                    continue
+                result[cid_key] = {
+                    "smiles": prop.get("CanonicalSMILES") or prop.get("ConnectivitySMILES", ""),
+                    "formula": prop.get("MolecularFormula", ""),
+                    "mw": str(prop.get("MolecularWeight", "")),
+                    "iupac": prop.get("IUPACName", ""),
+                    "title": prop.get("Title", ""),
+                }
+            fetched += len(chunk)
+            if progress_cb:
+                progress_cb(fetched, total)
+
+        # Phase B: GHS pictograms per CID
+        tasks = [_fetch_ghs_for_cid(session, cid, semaphore) for cid in cids_need_ghs]
+        save_counter = 0
+        for coro in asyncio.as_completed(tasks):
+            cid, pictograms = await coro
+            cid_key = str(cid)
+            if cid_key not in result:
+                result[cid_key] = {}
+            result[cid_key]["ghs_pictograms"] = pictograms
+            fetched += 1
+            save_counter += 1
+            if progress_cb:
+                progress_cb(fetched, total)
+            # Incremental save every 50 CIDs
+            if save_counter >= 50:
+                save_counter = 0
+                save_compound_info({"version": 1, "compounds": result})
+
+    return result
 
 
 def main():
