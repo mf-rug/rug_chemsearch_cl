@@ -407,6 +407,7 @@ BASE_TEMPLATE = """
             border-bottom: 1px solid var(--accent);
         }
         th { color: var(--text-dim); font-weight: 500; }
+        #results-data-table tbody tr:nth-child(odd) { background: rgba(128,128,128,0.04); }
         tr:hover { background: var(--accent); }
         tr.selected { background: var(--accent); border-left: 3px solid var(--highlight); }
 
@@ -496,26 +497,19 @@ BASE_TEMPLATE = """
 
         /* Search page specific */
         .search-hero {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 10px 16px;
-            background: var(--bg-light);
+            padding: 24px;
+            background: linear-gradient(135deg, color-mix(in srgb, var(--highlight) 15%, var(--bg-light)) 0%, color-mix(in srgb, var(--highlight) 6%, var(--bg-light)) 100%);
+            border: 1.5px solid color-mix(in srgb, var(--highlight) 40%, transparent);
             border-radius: 12px;
             margin-bottom: 25px;
-            flex-wrap: wrap;
-            gap: 10px;
+            box-shadow: 0 0 20px color-mix(in srgb, var(--highlight) 15%, transparent), 0 2px 8px rgba(0,0,0,0.2);
         }
         .search-hero h2 {
-            font-size: 1.1rem;
-            margin: 0;
-            border: none;
-            color: var(--text);
-        }
-        .search-hero .hero-buttons {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
+            font-size: 1.15rem;
+            margin-bottom: 15px;
+            color: var(--highlight);
+            border-bottom: 1px solid color-mix(in srgb, var(--highlight) 30%, transparent);
+            padding-bottom: 10px;
         }
         .search-status {
             font-size: 0.9rem;
@@ -733,9 +727,9 @@ SEARCH_TEMPLATE = """
 </div>
 {% else %}
 
-<div class="search-hero">
-    <h2>Search Your {{ cid_count }} Chemicals</h2>
-    <div class="hero-buttons">
+<div class="card" style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
+    <h2 style="margin: 0; border: none; padding: 0;">Search Your {{ cid_count }} Chemicals</h2>
+    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
         <a href="{{ url_for('results_page', filter_id='all') }}" class="btn btn-success">View All</a>
         <button class="btn" onclick="window.open('https://pubchem.ncbi.nlm.nih.gov/', '_blank')">
             Open PubChem
@@ -743,7 +737,7 @@ SEARCH_TEMPLATE = """
     </div>
 </div>
 
-<div class="card">
+<div class="search-hero">
     <h2>Search PubChem Directly</h2>
     <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px;">
         <div class="search-input-wrapper">
@@ -785,16 +779,6 @@ SEARCH_TEMPLATE = """
 
     <div id="browser-warning" class="text-warning" style="display: none; margin-bottom: 15px; padding: 10px; background: rgba(255,193,7,0.15); border-radius: 6px; font-size: 0.9rem;"></div>
 
-    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">
-        <label style="font-size: 0.85rem; cursor: pointer; display: flex; align-items: center; gap: 5px;">
-            <input type="checkbox" id="show-app-searches" onchange="toggleAppSearches()">
-            Show app-generated searches
-        </label>
-        <span class="info">i
-            <span class="tip">App-generated searches are created when you combine your chemicals with a PubChem search. They usually aren't useful to combine again.</span>
-        </span>
-    </div>
-
     <div id="history-container" style="max-height: 350px; overflow-y: auto; margin-bottom: 20px;">
         <table id="history-table">
             <thead>
@@ -814,13 +798,19 @@ SEARCH_TEMPLATE = """
         </table>
     </div>
 
-    <div class="actions">
+    <div class="actions" style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
         <button class="btn btn-success" onclick="combineSelectedSearch('AND', this)" disabled id="btn-combine-and">
             Find in My Chemicals (AND)
         </button>
         <button class="btn btn-secondary" onclick="combineSelectedSearch('NOT', this)" disabled id="btn-combine-not">
             Exclude from My Chemicals (NOT)
         </button>
+        <span style="margin-left: auto; display: flex; align-items: center; gap: 6px;">
+            <span id="toggle-app-searches" onclick="toggleAppSearches()" style="cursor: pointer; font-size: 0.8rem; padding: 4px 10px; border-radius: 12px; border: 1px solid var(--accent); color: var(--text-dim); user-select: none;">App searches</span>
+            <span class="info">i
+                <span class="tip">App-generated searches are created when you combine your chemicals with a PubChem search. They usually aren't useful to combine again.</span>
+            </span>
+        </span>
     </div>
     <p class="text-dim" style="margin-top: 15px; font-size: 0.85rem;">
         <strong>AND:</strong> Which of my chemicals match this search? &nbsp;
@@ -890,8 +880,12 @@ function saveShowAppSearches(show) {
 }
 
 function toggleAppSearches() {
-    const checkbox = document.getElementById('show-app-searches');
-    const show = checkbox.checked;
+    const toggle = document.getElementById('toggle-app-searches');
+    const wasActive = toggle.dataset.active === '1';
+    const show = !wasActive;
+    toggle.dataset.active = show ? '1' : '0';
+    toggle.style.background = show ? 'var(--highlight)' : 'transparent';
+    toggle.style.color = show ? '#fff' : 'var(--text-dim)';
     saveShowAppSearches(show);
 
     // Filter and re-render
@@ -928,8 +922,12 @@ async function loadHistory() {
 
         // Apply user preference
         const showAppSearches = getShowAppSearches();
-        const checkbox = document.getElementById('show-app-searches');
-        if (checkbox) checkbox.checked = showAppSearches;
+        const toggle = document.getElementById('toggle-app-searches');
+        if (toggle) {
+            toggle.dataset.active = showAppSearches ? '1' : '0';
+            toggle.style.background = showAppSearches ? 'var(--highlight)' : 'transparent';
+            toggle.style.color = showAppSearches ? '#fff' : 'var(--text-dim)';
+        }
 
         searchHistory = showAppSearches ? allHistory : filteredHistory;
 
@@ -1297,13 +1295,14 @@ RESULTS_TEMPLATE = """
     .structure-large { display: none; position: absolute; z-index: 100; width: 250px; height: 250px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); background: white; border-radius: 4px; top: 0; left: 0; }
     .structure-cell:hover .structure-large { display: block; }
     .structure-cell:hover .structure-thumb { visibility: hidden; }
-    .ghs-icon { width: 24px; height: 24px; margin-right: 2px; vertical-align: middle; }
+    .ghs-icon { width: 24px; height: 24px; margin-right: 2px; vertical-align: middle; background: white; }
     .smiles-cell { font-family: 'SF Mono', Monaco, monospace; font-size: 0.75rem; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .col-picker { background: var(--bg-light); border: 1px solid var(--accent); border-radius: 6px; padding: 10px 15px; margin-bottom: 15px; display: none; }
     .col-picker.open { display: flex; flex-wrap: wrap; gap: 8px 16px; }
     .col-picker label { font-size: 0.85rem; cursor: pointer; display: flex; align-items: center; gap: 4px; }
 
     /* DataTables dark theme customization */
+    div.dt-container div.dt-layout-row { margin-top: 0.2em; margin-bottom: 0; }
     .dataTables_wrapper { color: var(--text); }
     .dataTables_wrapper .dataTables_length,
     .dataTables_wrapper .dataTables_filter,
@@ -1328,10 +1327,23 @@ RESULTS_TEMPLATE = """
         background: var(--highlight) !important;
     }
 
+    .dt-toolbar {
+        display: flex !important;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 12px;
+        width: 100%;
+    }
+    .dt-toolbar .dt-buttons { margin-bottom: 0; }
+    .dt-toolbar .dataTables_length { margin: 0; }
+    .dt-toolbar .dataTables_filter { margin: 0; margin-left: auto; flex: 1; }
+    .dt-toolbar .dataTables_filter label { display: flex; align-items: center; gap: 6px; }
+    .dt-toolbar .dataTables_filter input { flex: 1; }
+
     .dt-buttons {
         display: flex;
         gap: 5px;
-        margin-bottom: 10px;
     }
 
     .dt-button {
@@ -1355,12 +1367,13 @@ RESULTS_TEMPLATE = """
     .print-header { display: none; }
 
     #mw-slider { margin: 0 8px; }
-    #mw-slider .noUi-connect { background: var(--highlight); }
+    #mw-slider .noUi-connect { background: #8c8c8c; }
     #mw-slider .noUi-handle { border-color: var(--highlight); background: var(--card-bg); }
     #mw-slider .noUi-tooltip { background: var(--card-bg); color: var(--text); border-color: var(--border); font-size: 0.75rem; }
     #mw-slider .noUi-pips { color: var(--text-dim); }
     #mw-slider .noUi-marker { background: var(--border); }
     #mw-slider .noUi-value { color: var(--text-dim); font-size: 0.7rem; }
+    #mw-slider .noUi-pips { top: 100%; padding-top: 2px; }
 
     @media print {
         nav, .dt-buttons, #advanced-filters, .dataTables_length, .dataTables_filter,
@@ -1416,10 +1429,11 @@ RESULTS_TEMPLATE = """
         <hr>
     </div>
 
+    <div class="card" style="margin-bottom: 5px; background: var(--accent); padding: 15px 10px 5px 15px;">
     {% if filter_results|length > 0 %}
     <div style="margin-bottom: 15px;">
-        <label class="text-dim" style="font-size: 0.85rem;">Filter: </label>
-        <select onchange="if(this.value) window.location.href='/results?filter_id='+this.value;" style="font-size: 0.85rem;">
+        <label class="text-dim" style="font-size: 1rem;">Search: </label>
+        <select onchange="if(this.value) window.location.href='/results?filter_id='+this.value;" style="font-size: 1rem; background: var(--highlight); margin: 5px; width: 80%;">
             <option value="all" {{ 'selected' if current_filter and current_filter.id == 'all' else '' }}>
                 All Chemicals ({{ rug_table.rows|length if rug_table else 0 }} total)
             </option>
@@ -1447,11 +1461,11 @@ RESULTS_TEMPLATE = """
     </div>
     {% endif %}
 
-    <div id="advanced-filters" style="margin-bottom: 15px; padding: 12px 15px; border: 1px solid var(--border); border-radius: 6px;">
-        <div style="display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-end;">
+    <div id="advanced-filters" style="padding: 12px 15px;">
+        <div style="display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start;">
             <div style="min-width: 280px; flex: 1;">
-                <label class="text-dim" style="font-size: 0.8rem; display: block; margin-bottom: 8px;">Molecular Weight</label>
-                <div id="mw-slider" style="margin-bottom: 35px;"></div>
+                <label class="text-dim" style="font-size: 0.8rem; display: block; margin-bottom: 8px; text-align: center;">Molecular Weight</label>
+                <div id="mw-slider" style="margin-bottom: 20px;"></div>
             </div>
             <div>
                 <label class="text-dim" style="font-size: 0.8rem; display: block; margin-bottom: 4px;">Formula</label>
@@ -1468,11 +1482,12 @@ RESULTS_TEMPLATE = """
                 </select>
             </div>
             {% endif %}
-            <div style="display: flex; gap: 6px;">
+            <div style="display: flex; gap: 6px; align-self: center;">
                 <button class="btn" style="font-size: 0.8rem;" id="apply-filters-btn">Apply Filters</button>
-                <button class="btn btn-secondary" style="font-size: 0.8rem;" id="clear-filters-btn">Clear</button>
+                <button class="btn btn-secondary" style="font-size: 0.8rem; background: var(--bg-light);" id="clear-filters-btn">Clear</button>
             </div>
         </div>
+    </div>
     </div>
 
     {% if filtered_rows %}
@@ -1598,7 +1613,10 @@ $(document).ready(function() {
         lengthMenu: [[10, 25, 50, 100, -1], [10, 25, 50, 100, "All"]],
         order: [[ALL_COLS.indexOf('Name'), 'asc']],
         columnDefs: columnDefs,
-        dom: 'Blfrtip',
+        layout: {
+            topStart: ['buttons', 'pageLength'],
+            topEnd: 'search'
+        },
         buttons: [
             {
                 extend: 'colvis',
