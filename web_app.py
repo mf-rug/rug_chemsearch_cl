@@ -239,7 +239,7 @@ BASE_TEMPLATE = """
     </script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ title }} - Chemical Search</title>
+    <title>{{ title }} - RUG Chemical Search</title>
     <style>
         :root, [data-theme="dark"] {
             --bg: #1a1a2e;
@@ -643,12 +643,26 @@ BASE_TEMPLATE = """
 <body>
     <header>
         <div class="container">
-            <h1>Chemical <span>Search</span></h1>
+            <h1 style="display: flex; align-items: center; gap: 8px;">
+                <svg id="logo-icon" width="28" height="28" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" style="flex-shrink: 0; cursor: pointer; transition: transform 0.3s, filter 0.3s;" onmouseenter="this.style.transform='rotate(-15deg) scale(1.2)';this.style.filter='drop-shadow(0 0 6px var(--highlight))'" onmouseleave="if(!this.dataset.spinning){this.style.transform='';this.style.filter='';}" onclick="(function(el){el.dataset.spinning='1';el.style.transition='transform 0.8s cubic-bezier(0.2,0.8,0.2,1), filter 0.3s';el.style.transform='rotate(720deg) scale(1)';el.style.filter='drop-shadow(0 0 12px var(--highlight))';var liquid=el.querySelector('#flask-liquid');if(liquid){liquid.style.transition='fill-opacity 0.4s';liquid.style.fillOpacity='0.6';}var bubbles=el.querySelectorAll('.bubble');bubbles.forEach(function(b,i){b.style.transition='opacity 0.3s '+(i*0.15)+'s, transform 0.6s '+(i*0.15)+'s';b.style.opacity='1';b.style.transform='translateY(-6px)';});setTimeout(function(){el.dataset.spinning='';el.style.transition='transform 0.3s, filter 0.3s';el.style.transform='';el.style.filter='';if(liquid){liquid.style.fillOpacity='0';}bubbles.forEach(function(b){b.style.opacity='0';b.style.transform='';});},1000);})(this)">
+                    <path d="M12 4V12L6 24C5.2 25.6 6.4 28 8 28H20C21.6 28 22.8 25.6 22 24L16 12V4" stroke="var(--highlight)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path id="flask-liquid" d="M8 23C8 23 10 20 14 20C18 20 20 23 20 23L18.5 26C18 27 17 27.5 16 27.5H12C11 27.5 10 27 9.5 26L8 23Z" fill="var(--highlight)" fill-opacity="0"/>
+                    <circle class="bubble" cx="11" cy="19" r="1.2" fill="var(--highlight)" opacity="0"/>
+                    <circle class="bubble" cx="14" cy="17" r="0.9" fill="var(--highlight)" opacity="0"/>
+                    <circle class="bubble" cx="16.5" cy="19.5" r="1" fill="var(--highlight)" opacity="0"/>
+                    <line x1="10" y1="4" x2="18" y2="4" stroke="var(--highlight)" stroke-width="2" stroke-linecap="round"/>
+                    <path d="M9 20H19" stroke="var(--highlight)" stroke-width="1.5" stroke-linecap="round" opacity="0.5"/>
+                    <circle cx="24" cy="12" r="5" stroke="var(--text-dim)" stroke-width="2"/>
+                    <line x1="27.5" y1="15.5" x2="30" y2="18" stroke="var(--text-dim)" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+                RUG Chemical <span>Search</span>
+            </h1>
             <nav>
                 <a href="{{ url_for('search') }}" class="{{ 'active' if active_page == 'search' else '' }}">Search</a>
                 <a href="{{ url_for('results_page') }}" class="{{ 'active' if active_page == 'results' else '' }}">Results</a>
                 <a href="{{ url_for('setup') }}" class="{{ 'active' if active_page == 'setup' else '' }}">Setup</a>
                 <span class="nav-divider"></span>
+                <button class="btn-quit" onclick="document.getElementById('about-modal').style.display='flex'" title="About this app" style="font-size: 1.1rem; font-weight: bold; width: 28px; height: 28px; border-radius: 50%; border: 1.5px solid var(--text-dim); display: inline-flex; align-items: center; justify-content: center; padding: 0;">?</button>
                 <button class="btn-quit" onclick="toggleTheme()" id="theme-toggle" title="Toggle light/dark mode" style="font-size: 1.2rem;">☀️</button>
                 <button class="btn-quit" onclick="quitApp()">Quit App</button>
             </nav>
@@ -712,6 +726,30 @@ BASE_TEMPLATE = """
         }
     </script>
     {% block scripts %}{% endblock %}
+
+<!-- About modal -->
+<div id="about-modal" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.7); z-index:1000; align-items:center; justify-content:center;" onclick="if(event.target===this)this.style.display='none'">
+    <div style="background:var(--bg-light); border-radius:8px; max-width:480px; width:90%; padding:24px; position:relative;">
+        <button onclick="document.getElementById('about-modal').style.display='none'" style="position:absolute; top:12px; right:16px; background:none; border:none; font-size:1.4rem; cursor:pointer; color:var(--text-dim);">&times;</button>
+        <h2 style="margin-top:0;">About RUG Chemical Search</h2>
+        <p style="color:var(--text-dim); line-height:1.6; font-size:0.9rem;">
+            This app lets you cross-reference your lab's chemical inventory with
+            <a href="https://pubchem.ncbi.nlm.nih.gov/" target="_blank" style="color:var(--link);">PubChem</a>.
+            Search by name, CAS number, structure, or keyword to find which of your chemicals match,
+            and explore their properties.
+        </p>
+        <p style="color:var(--text-dim); line-height:1.6; font-size:0.9rem;">
+            You can also search PubChem directly in your browser &mdash; the app detects those searches
+            automatically and makes them available for combining with your inventory.
+        </p>
+        <hr style="border:none; border-top:1px solid var(--accent); margin:16px 0;">
+        <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:0;">
+            Bug reports &amp; feature requests:
+            <a href="https://github.com/mf-rug/rug_chemsearch_cl/issues" target="_blank" style="color:var(--link);">GitHub Issues</a>
+            or email <a href="mailto:m.j.l.j.furst@rug.nl" style="color:var(--link);">Max</a>.
+        </p>
+    </div>
+</div>
 </body>
 </html>
 """
@@ -727,22 +765,15 @@ SEARCH_TEMPLATE = """
 </div>
 {% else %}
 
-<div class="card" style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
-    <h2 style="margin: 0; border: none; padding: 0;">Search Your {{ cid_count }} Chemicals</h2>
-    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-        <a href="{{ url_for('results_page', filter_id='all') }}" class="btn btn-success">View All</a>
-        <button class="btn" onclick="window.open('https://pubchem.ncbi.nlm.nih.gov/', '_blank')">
-            Open PubChem
-        </button>
-    </div>
-</div>
-
 <div class="search-hero">
-    <h2>Search PubChem Directly</h2>
+    <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 4px;">
+        <h2 style="margin: 0;">Search Your {{ cid_count }} Chemicals</h2>
+        <a href="{{ url_for('results_page', filter_id='all') }}" class="btn btn-success" style="padding: 5px 14px; font-size: 0.85rem;">View All {{ cid_count }}</a>
+    </div>
     <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px;">
         <div class="search-input-wrapper">
             <input type="text" id="direct-search-input" placeholder="Enter name, CAS, or keyword..."
-                   onkeydown="if(event.key==='Enter'){directPubchemSearch(document.getElementById('direct-search-btn'));}">
+                   onkeydown="if(event.key==='Enter'){directPubchemSearch(document.getElementById('direct-search-btn'), false);}">
             <button class="draw-btn" onclick="openStructureDrawer()" title="Draw structure">
                 <svg width="20" height="22" viewBox="0 0 20 22" fill="none" stroke="currentColor" stroke-width="1.5">
                     <path d="M10 1L18.66 5.5V14.5L10 19L1.34 14.5V5.5L10 1Z"/>
@@ -750,91 +781,83 @@ SEARCH_TEMPLATE = """
                 <span class="draw-label">Draw</span>
             </button>
         </div>
-        <button class="btn btn-success" id="direct-search-btn" onclick="directPubchemSearch(this)">Search</button>
+        <button class="btn btn-success" id="direct-search-btn" onclick="directPubchemSearch(this, false)">Search</button>
+        <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 0.85rem; user-select: none; padding: 4px 10px; border-radius: 12px; border: 1px solid var(--accent); color: var(--text-dim);">
+            <input type="checkbox" id="exclude-toggle" style="margin: 0;"> Exclude
+        </label>
     </div>
-    <div class="mode-selector">
-        <button class="mode-pill active" data-mode="name" onclick="selectMode('name', this)">Name / CAS</button>
-        <button class="mode-pill" data-mode="smiles" onclick="selectMode('smiles', this)">SMILES</button>
-        <button class="mode-pill" data-mode="substructure" onclick="selectMode('substructure', this)">Substructure</button>
-        <button class="mode-pill" data-mode="superstructure" onclick="selectMode('superstructure', this)">Superstructure</button>
-        <button class="mode-pill" data-mode="similarity" onclick="selectMode('similarity', this)">Similarity</button>
+    <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+        <div class="mode-selector" style="margin-bottom: 0;">
+            <button class="mode-pill active" data-mode="name" onclick="selectMode('name', this)">Name / CAS</button>
+            <button class="mode-pill" data-mode="smiles" onclick="selectMode('smiles', this)">SMILES</button>
+            <button class="mode-pill" data-mode="substructure" onclick="selectMode('substructure', this)">Substructure</button>
+            <button class="mode-pill" data-mode="superstructure" onclick="selectMode('superstructure', this)">Superstructure</button>
+            <button class="mode-pill" data-mode="similarity" onclick="selectMode('similarity', this)">Similarity</button>
+        </div>
+        <a href="#" onclick="directPubchemSearch(document.getElementById('direct-search-btn'), true); return false;" style="font-size: 0.8rem; color: var(--text-dim); text-decoration: underline;">Add to history only</a>
     </div>
     <p class="text-dim" style="font-size: 0.85rem; margin-top: 10px;" id="search-mode-hint">
-        Search by name, CAS number, or keyword. Results will appear in the list below.
+        Search by name, CAS number, or keyword. Results will be combined with your lab chemicals.
     </p>
 </div>
 
 <div class="card">
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-        <div class="card-header" style="border: none; margin: 0; padding: 0;">
-            <h2 style="margin: 0;">Recent PubChem Searches</h2>
-        </div>
-        <div style="display: flex; align-items: center; gap: 10px;">
+    <div class="collapsible-header" onclick="toggleSection('history-section')">
+        <h2 style="margin: 0; border: none; padding: 0;">Search History</h2>
+        <span class="toggle-icon" id="history-section-icon">+ expand</span>
+    </div>
+    <div class="collapsible-content" id="history-section">
+        <p class="text-dim" style="font-size: 0.85rem; margin-bottom: 12px;">
+            Searches you make above appear here, along with any PubChem searches you perform directly in your browser.
+            You can also <a href="#" onclick="window.open('https://pubchem.ncbi.nlm.nih.gov/', '_blank'); return false;" style="color: var(--link);">open PubChem</a> and search there — results will show up here automatically.
+        </p>
+
+        <div style="display: flex; justify-content: flex-end; align-items: center; gap: 10px; margin-bottom: 10px;">
             <span class="text-dim" style="font-size: 0.8rem;" id="auto-refresh-status"></span>
             <button class="btn btn-secondary" style="padding: 5px 12px; font-size: 0.8rem;" onclick="refreshHistory()">
                 Refresh
             </button>
         </div>
-    </div>
 
-    <div id="browser-warning" class="text-warning" style="display: none; margin-bottom: 15px; padding: 10px; background: rgba(255,193,7,0.15); border-radius: 6px; font-size: 0.9rem;"></div>
+        <div id="browser-warning" class="text-warning" style="display: none; margin-bottom: 15px; padding: 10px; background: rgba(255,193,7,0.15); border-radius: 6px; font-size: 0.9rem;"></div>
 
-    <div id="history-container" style="max-height: 350px; overflow-y: auto; margin-bottom: 20px;">
-        <table id="history-table">
-            <thead>
-                <tr>
-                    <th style="width: 30px;"></th>
-                    <th>Search Query</th>
-                    <th>Browser</th>
-                    <th>When</th>
-                    <th></th>
-                </tr>
-            </thead>
-            <tbody id="history-body">
-                <tr><td colspan="5" class="text-dim" style="text-align: center; padding: 20px;">
-                    <span class="loading" style="width: 14px; height: 14px;"></span> Loading...
-                </td></tr>
-            </tbody>
-        </table>
-    </div>
+        <div id="history-container" style="max-height: 350px; overflow-y: auto; margin-bottom: 20px;">
+            <table id="history-table">
+                <thead>
+                    <tr>
+                        <th style="width: 30px;"></th>
+                        <th>Search Query</th>
+                        <th>Browser</th>
+                        <th>When</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody id="history-body">
+                    <tr><td colspan="5" class="text-dim" style="text-align: center; padding: 20px;">
+                        <span class="loading" style="width: 14px; height: 14px;"></span> Loading...
+                    </td></tr>
+                </tbody>
+            </table>
+        </div>
 
-    <div class="actions" style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
-        <button class="btn btn-success" onclick="combineSelectedSearch('AND', this)" disabled id="btn-combine-and">
-            Find in My Chemicals (AND)
-        </button>
-        <button class="btn btn-secondary" onclick="combineSelectedSearch('NOT', this)" disabled id="btn-combine-not">
-            Exclude from My Chemicals (NOT)
-        </button>
-        <span style="margin-left: auto; display: flex; align-items: center; gap: 6px;">
-            <span id="toggle-app-searches" onclick="toggleAppSearches()" style="cursor: pointer; font-size: 0.8rem; padding: 4px 10px; border-radius: 12px; border: 1px solid var(--accent); color: var(--text-dim); user-select: none;">App searches</span>
-            <span class="info">i
-                <span class="tip">App-generated searches are created when you combine your chemicals with a PubChem search. They usually aren't useful to combine again.</span>
+        <div class="actions" style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+            <button class="btn btn-success" onclick="combineSelectedSearch('AND', this)" disabled id="btn-combine-and">
+                Find in My Chemicals (AND)
+            </button>
+            <button class="btn btn-secondary" onclick="combineSelectedSearch('NOT', this)" disabled id="btn-combine-not">
+                Exclude from My Chemicals (NOT)
+            </button>
+            <span style="margin-left: auto; display: flex; align-items: center; gap: 6px;">
+                <span id="toggle-app-searches" onclick="toggleAppSearches()" style="cursor: pointer; font-size: 0.8rem; padding: 4px 10px; border-radius: 12px; border: 1px solid var(--accent); color: var(--text-dim); user-select: none;">App searches</span>
+                <span class="info">i
+                    <span class="tip">App-generated searches are created when you combine your chemicals with a PubChem search. They usually aren't useful to combine again.</span>
+                </span>
             </span>
-        </span>
-    </div>
-    <p class="text-dim" style="margin-top: 15px; font-size: 0.85rem;">
-        <strong>AND:</strong> Which of my chemicals match this search? &nbsp;
-        <strong>NOT:</strong> Which of my chemicals do NOT match this search?
-    </p>
-</div>
-
-<div class="card">
-    <div class="collapsible-header" onclick="toggleSection('new-search-section')">
-        <h2 style="margin: 0; border: none; padding: 0;">New Search</h2>
-        <span class="toggle-icon" id="new-search-section-icon">+ expand</span>
-    </div>
-    <div class="collapsible-content" id="new-search-section">
-        <p style="margin-bottom: 15px;">
-            To search for specific structures, properties, or keywords:
+        </div>
+        <p class="text-dim" style="margin-top: 15px; font-size: 0.85rem;">
+            <strong>AND:</strong> Which of my chemicals match this search? &nbsp;
+            <strong>NOT:</strong> Which of my chemicals do NOT match this search?
         </p>
-        <ol style="margin-left: 20px; margin-bottom: 15px; color: var(--text-dim);">
-            <li>Click the button below to open PubChem</li>
-            <li>Search for what you're interested in (e.g., "flammable", a structure, etc.)</li>
-            <li>Come back here - your search will appear in the list above</li>
-        </ol>
-        <button class="btn" onclick="window.open('https://pubchem.ncbi.nlm.nih.gov/', '_blank')">
-            Open PubChem
-        </button>
     </div>
 </div>
 
@@ -1095,7 +1118,7 @@ function toggleSection(id) {
 
 // --- Direct PubChem search ---
 const SEARCH_MODE_INFO = {
-    'name': {placeholder: 'Enter name, CAS, or keyword...', hint: 'Search by name, CAS number, or keyword. Results will appear in the list below.'},
+    'name': {placeholder: 'Enter name, CAS, or keyword...', hint: 'Search by name, CAS number, or keyword. Results will be combined with your lab chemicals.'},
     'smiles': {placeholder: 'Enter SMILES or draw...', hint: 'Find exact compound match by SMILES notation.'},
     'substructure': {placeholder: 'Enter SMILES or draw...', hint: 'Find compounds containing this structure as a substructure.'},
     'superstructure': {placeholder: 'Enter SMILES or draw...', hint: 'Find compounds where query is a superstructure (contains the target).'},
@@ -1120,7 +1143,7 @@ function updateSearchPlaceholder() {
     hint.textContent = info.hint;
 }
 
-async function directPubchemSearch(btn) {
+async function directPubchemSearch(btn, historyOnly) {
     const input = document.getElementById('direct-search-input');
     const query = input.value.trim();
     const mode = currentSearchMode;
@@ -1143,10 +1166,41 @@ async function directPubchemSearch(btn) {
         const data = await resp.json();
 
         if (data.success) {
-            input.value = '';
-            await refreshHistory();
-            // Auto-select the new search
-            selectEntry(data.cache_key);
+            if (historyOnly) {
+                input.value = '';
+                await refreshHistory();
+                selectEntry(data.cache_key);
+            } else {
+                // Combine and navigate to results
+                btn.innerHTML = '<span class="loading"></span> Combining...';
+                const excludeOn = document.getElementById('exclude-toggle').checked;
+                const operation = excludeOn ? 'NOT' : 'AND';
+                const combResp = await fetch('/api/combine-pubchem/' + operation +
+                    '?cachekey=' + encodeURIComponent(data.cache_key),
+                    { method: 'POST' });
+                const combData = await combResp.json();
+
+                if (combData.error === 'stale_search') {
+                    alert(combData.message || 'This search has expired.');
+                    await fetch('/api/mark-stale-search', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({cache_key: combData.cache_key})
+                    });
+                    input.value = '';
+                    await refreshHistory();
+                } else if (combData.error) {
+                    alert('Error: ' + combData.error);
+                    // Fall back to showing in history
+                    input.value = '';
+                    await refreshHistory();
+                    selectEntry(data.cache_key);
+                } else if (combData.filter_id) {
+                    input.value = '';
+                    window.location.href = '/results?filter_id=' + combData.filter_id;
+                    return;
+                }
+            }
         } else {
             alert(data.error || 'Search failed');
         }

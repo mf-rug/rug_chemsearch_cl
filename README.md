@@ -1,4 +1,4 @@
-# Chemical Search
+# RUG Chemical Search
 
 A desktop app for searching your RUG chemicals inventory against PubChem. Find which of your chemicals match any structure, property, or keyword search.
 
@@ -49,16 +49,20 @@ After combining a search, the Results tab shows a DataTable of your matched chem
 
 ## Using the Search
 
-1. Go to [PubChem](https://pubchem.ncbi.nlm.nih.gov/) and search for anything (structures, properties, keywords)
-2. Come back to Chemical Search - your search appears in the list automatically
-3. Click **"Find in My Chemicals (AND)"** to see which of your chemicals match. After combining, the app navigates to a Results tab showing your RUG chemicals that matched
+### Direct search (recommended)
 
-The search list watches for changes automatically, so just search on PubChem and switch back.
+Type a query (name, CAS number, SMILES, keyword) into the search bar and click **Search**. The app searches PubChem and immediately cross-references the results with your inventory, taking you straight to the Results page.
+
+Toggle **Exclude** before searching to find chemicals that do *not* match instead.
+
+### Browser-based search
+
+You can also search on [PubChem](https://pubchem.ncbi.nlm.nih.gov/) directly in your browser. The app detects those searches automatically — expand the **Search History** section to see them, then use the combine buttons to cross-reference with your inventory.
 
 ### Search Operations
 
 - **AND**: Which of my chemicals match this search? (intersection)
-- **NOT**: Which of my chemicals do NOT match this search? (exclusion)
+- **NOT / Exclude**: Which of my chemicals do NOT match this search? (exclusion)
 
 ## Technical Details
 
