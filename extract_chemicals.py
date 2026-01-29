@@ -487,7 +487,9 @@ def get_default_browser() -> str | None:
     return None
 
 
-def combine_pubchem_cache_keys(key1: str, key2: str, operation: str = "AND") -> str | None:
+def combine_pubchem_cache_keys(
+    key1: str, key2: str, operation: str = "AND"
+) -> str | None | tuple[str, int]:
     """
     Combine two PubChem cache keys with a boolean operation.
 
@@ -497,7 +499,7 @@ def combine_pubchem_cache_keys(key1: str, key2: str, operation: str = "AND") -> 
         operation: Boolean operation (AND, OR, NOT)
 
     Returns:
-        Combined cache key, or None if failed
+        Tuple of (combined_cache_key, list_size), or None if failed
     """
     operation = operation.upper()
     if operation not in ("AND", "OR", "NOT"):
@@ -526,9 +528,14 @@ def combine_pubchem_cache_keys(key1: str, key2: str, operation: str = "AND") -> 
             data = resp.json()
             if "Response" in data and "List" in data["Response"]:
                 combined_key = data["Response"]["List"]["CacheKey"]
-                list_size = data["Response"].get("ListSize", "?")
+                list_size = data["Response"].get("ListSize", 0)
+                if isinstance(list_size, str):
+                    try:
+                        list_size = int(list_size)
+                    except ValueError:
+                        list_size = 0
                 print(f"Combined searches ({operation}): {list_size} results")
-                return combined_key
+                return (combined_key, list_size)
             elif "Error" in data.get("Response", {}):
                 print(f"PubChem combine error: {data['Response']['Error']}")
     except Exception as e:
@@ -916,8 +923,25 @@ async def repair_entry_by_text_search(
                 if cids:
                     best_match_cid = cids[0]  # First = best match
                     logger.info(f"Text search match: {entry_name} → CID {best_match_cid}")
+
+                    # Reverse-lookup real CAS from PubChem dump
+                    real_cas = None
+                    try:
+                        cas_to_cid = load_pubchem_dump()
+                        if cas_to_cid:
+                            # Build CID→CAS reverse map (first match wins)
+                            for dump_cas, dump_cid in cas_to_cid.items():
+                                if dump_cid == best_match_cid:
+                                    real_cas = dump_cas
+                                    break
+                            if real_cas:
+                                logger.info(f"Reverse CAS lookup: CID {best_match_cid} → CAS {real_cas}")
+                    except Exception as e:
+                        logger.warning(f"CAS reverse lookup failed for CID {best_match_cid}: {e}")
+
                     return {
                         "cid": best_match_cid,
+                        "real_cas": real_cas,
                         "repair_source": f"text_search:{query}",
                         "repair_timestamp": datetime.now().isoformat()
                     }
@@ -933,16 +957,15 @@ async def repair_entry_by_text_search(
 
 async def repair_unmatched_entries(
     progress_callback=None,
-    review_mode=False,
     skip_repaired=True
 ) -> dict:
     """
     Repair unmatched entries by searching PubChem with entry names.
+    Always operates in review mode — results are returned for user approval.
 
     Args:
         progress_callback: Optional callback(processed, total, current_name)
-        review_mode: If True, don't save repairs (return for review instead)
-        skip_repaired: If True, skip entries already successfully repaired
+        skip_repaired: If True, skip entries already repaired or failed
 
     Returns:
         {
@@ -950,7 +973,8 @@ async def repair_unmatched_entries(
             "successful_repairs": int,
             "failed_repairs": int,
             "skipped": int,
-            "repaired_entries": [{"cas": str, "name": str, "cid": int}, ...]
+            "repaired_entries": [{"row_index": int, "cas": str, "name": str, "cid": int, "real_cas": str|None}, ...],
+            "failed_indices": [int, ...]
         }
     """
     # Load current data
@@ -961,35 +985,34 @@ async def repair_unmatched_entries(
         logger.error("Cannot repair: missing RUG table or CID cache")
         return {"error": "Missing data"}
 
-    # Find unmatched entries
+    # Find unmatched entries (track row_index)
     unmatched = []
-    for row in rug_table.get("rows", []):
+    for row_index, row in enumerate(rug_table.get("rows", [])):
         cid_val = row.get("CID")
         # Check for None or NaN
         if cid_val is None or (isinstance(cid_val, float) and cid_val != cid_val):
             cas = row.get("Casnr", "")
             name = row.get("Name", "")
 
-            # Skip if already repaired and skip_repaired=True
-            if skip_repaired and cas:
-                cache_entry = cid_cache.get("results", {}).get(cas, {})
-                if cache_entry.get("status") == "repaired":
-                    continue  # Already successfully repaired
+            # Skip if already repaired or failed (check row metadata)
+            if skip_repaired:
+                row_status = row.get("_repair_status")
+                if row_status in ("repaired", "failed"):
+                    continue
 
             if name and name != "-":
-                unmatched.append({"cas": cas, "name": name, "row": row})
+                unmatched.append({"cas": cas, "name": name, "row": row, "row_index": row_index})
 
     total = len(unmatched)
-    logger.info(f"Starting repair for {total} unmatched entries (review_mode={review_mode})")
+    logger.info(f"Starting repair for {total} unmatched entries (review-only)")
 
-    # Process entries 1-by-1 with text search
     results = {
         "total_attempts": total,
         "successful_repairs": 0,
         "failed_repairs": 0,
         "skipped": 0,
         "repaired_entries": [],
-        "review_mode": review_mode
+        "failed_indices": []
     }
 
     async with aiohttp.ClientSession() as session:
@@ -999,7 +1022,6 @@ async def repair_unmatched_entries(
             if progress_callback:
                 progress_callback(idx + 1, total, entry["name"])
 
-            # Attempt text search repair
             repair_result = await repair_entry_by_text_search(
                 entry["name"],
                 entry["cas"],
@@ -1007,53 +1029,19 @@ async def repair_unmatched_entries(
                 semaphore
             )
 
-            # Store repair result
-            cas = entry["cas"]
             if repair_result:
-                # Success: collect for results
                 results["successful_repairs"] += 1
                 results["repaired_entries"].append({
-                    "cas": cas,
+                    "row_index": entry["row_index"],
+                    "cas": entry["cas"],
                     "name": entry["name"],
                     "cid": repair_result["cid"],
+                    "real_cas": repair_result.get("real_cas"),
                     "repair_source": repair_result["repair_source"]
                 })
-
-                # Update cache immediately if not in review mode
-                if not review_mode and cas and cas in cid_cache.get("results", {}):
-                    cache_entry = cid_cache["results"][cas]
-                    cache_entry["repair_attempted"] = True
-                    cache_entry["status"] = "repaired"
-                    cache_entry["cid"] = repair_result["cid"]
-                    cache_entry["repair_source"] = repair_result["repair_source"]
-                    cache_entry["repair_timestamp"] = repair_result["repair_timestamp"]
             else:
-                # Failed: mark as attempted (only if not review mode)
                 results["failed_repairs"] += 1
-                if not review_mode and cas and cas in cid_cache.get("results", {}):
-                    cache_entry = cid_cache["results"][cas]
-                    cache_entry["repair_attempted"] = True
-
-            # Save progress every 10 entries (only in auto-accept mode)
-            if not review_mode and (idx + 1) % 10 == 0:
-                save_cid_cache(
-                    cid_cache["source_html"],
-                    cid_cache["source_hash"],
-                    cid_cache["results"]
-                )
-                logger.info(f"Repair progress saved: {idx + 1}/{total}")
-
-    # Final save (only in auto-accept mode)
-    if not review_mode:
-        save_cid_cache(
-            cid_cache["source_html"],
-            cid_cache["source_hash"],
-            cid_cache["results"]
-        )
-
-        # Rebuild RUG table with repaired CIDs
-        original_df = parse_html_table(Path(cid_cache["source_html"]))
-        save_rug_table(original_df, cid_cache["results"])
+                results["failed_indices"].append(entry["row_index"])
 
     logger.info(f"Repair complete: {results['successful_repairs']} repaired, {results['failed_repairs']} failed")
     return results
@@ -1299,13 +1287,14 @@ def upload_cids_to_pubchem_cache(cids: list[str]) -> str | None:
         cache_key string if successful, None if failed
     """
     try:
-        print("Uploading CID list to PubChem cache...")
+        print(f"Uploading {len(cids)} CIDs to PubChem cache...")
         resp = requests.post(
             "https://pubchem.ncbi.nlm.nih.gov/list_gateway/list_gateway.cgi"
             "?format=json&action=post_to_cache&id_type=cid",
             data={"ids": ",".join(cids)},
             timeout=60
         )
+        print(f"PubChem cache response: status={resp.status_code}")
         if resp.status_code == 200:
             data = resp.json()
             if "Response" in data and "cache_key" in data["Response"]:
@@ -1315,6 +1304,10 @@ def upload_cids_to_pubchem_cache(cids: list[str]) -> str | None:
                 return cache_key
             elif "error" in data.get("Response", {}):
                 print(f"PubChem cache error: {data['Response']['error']}")
+            else:
+                print(f"Unexpected PubChem response structure: {data}")
+        else:
+            print(f"PubChem cache HTTP error: {resp.status_code}, body: {resp.text[:500]}")
     except Exception as e:
         print(f"Failed to upload to PubChem cache: {e}")
     return None
@@ -1982,8 +1975,10 @@ def save_filter_result(search_name: str, operation: str, matching_cids: list[int
         "pubchem_url": pubchem_url,
         "created": datetime.now().isoformat(),
     })
-    # Keep last 10
-    results = results[:10]
+    # Keep all saved + last 10 unsaved
+    saved = [r for r in results if r.get("saved")]
+    unsaved = [r for r in results if not r.get("saved")]
+    results = saved + unsaved[:10]
     FILTER_RESULTS_FILE.write_text(json.dumps(results, indent=2))
     logger.info("Saved filter: '%s' (%s) → %d matches", search_name, operation, len(matching_cids))
     return filter_id
@@ -1997,6 +1992,27 @@ def load_filter_results() -> list[dict]:
         return json.loads(FILTER_RESULTS_FILE.read_text())
     except (json.JSONDecodeError, OSError):
         return []
+
+
+def toggle_saved_filter(filter_id: str, saved: bool) -> bool:
+    """Set the saved flag on a filter result. Returns True if found."""
+    results = load_filter_results()
+    for r in results:
+        if r["id"] == filter_id:
+            r["saved"] = saved
+            FILTER_RESULTS_FILE.write_text(json.dumps(results, indent=2))
+            return True
+    return False
+
+
+def delete_filter_result(filter_id: str) -> bool:
+    """Remove a filter result entirely. Returns True if found."""
+    results = load_filter_results()
+    new_results = [r for r in results if r["id"] != filter_id]
+    if len(new_results) == len(results):
+        return False
+    FILTER_RESULTS_FILE.write_text(json.dumps(new_results, indent=2))
+    return True
 
 
 def load_app_searches() -> set[str]:
@@ -2013,16 +2029,78 @@ def load_app_searches() -> set[str]:
 def save_app_search(cache_key: str) -> None:
     """Record a cache key as app-generated."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Load existing data to preserve the searches field
+    existing = {}
+    if APP_SEARCHES_FILE.exists():
+        try:
+            existing = json.loads(APP_SEARCHES_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
     app_searches = load_app_searches()
     app_searches.add(cache_key)
     # Keep last 50 to avoid unbounded growth
     app_searches_list = list(app_searches)[-50:]
+
     data = {
-        "version": 1,
+        "version": 2,
         "cache_keys": app_searches_list,
+        "searches": existing.get("searches", []),
     }
     APP_SEARCHES_FILE.write_text(json.dumps(data, indent=2))
     logger.info("Recorded app-generated search: %s", cache_key[:20])
+
+
+def save_app_search_with_metadata(cache_key: str, query: str, count: int) -> None:
+    """Save an app-initiated direct search with full metadata.
+
+    Note: Direct searches are NOT added to the cache_keys list because they
+    are meant to be combined (unlike combined search results which shouldn't
+    be combined again).
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Load existing data
+    data = {"version": 2, "cache_keys": [], "searches": []}
+    if APP_SEARCHES_FILE.exists():
+        try:
+            existing = json.loads(APP_SEARCHES_FILE.read_text())
+            data["cache_keys"] = existing.get("cache_keys", [])
+            data["searches"] = existing.get("searches", [])
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Note: We intentionally do NOT add to cache_keys here.
+    # cache_keys is for combined searches that shouldn't be combined again.
+    # Direct searches should appear in the normal list for combining.
+
+    # Add to searches list with metadata
+    search_entry = {
+        "cache_key": cache_key,
+        "query": query,
+        "count": count,
+        "timestamp": datetime.now().isoformat(),
+        "source": "direct_search",
+    }
+    data["searches"].append(search_entry)
+    # Keep last 50 searches
+    data["searches"] = data["searches"][-50:]
+
+    APP_SEARCHES_FILE.write_text(json.dumps(data, indent=2))
+    logger.info("Recorded direct search '%s' with %d results: %s", query, count, cache_key[:20])
+
+
+def load_app_search_metadata() -> dict[str, dict]:
+    """Load app search metadata as dict of cache_key -> metadata."""
+    if not APP_SEARCHES_FILE.exists():
+        return {}
+    try:
+        data = json.loads(APP_SEARCHES_FILE.read_text())
+        searches = data.get("searches", [])
+        return {s["cache_key"]: s for s in searches if "cache_key" in s}
+    except (json.JSONDecodeError, OSError):
+        return {}
 
 
 def load_stale_searches() -> set[str]:
@@ -2442,8 +2520,9 @@ Data sources (in order of priority):
                         open_pubchem_search(pubchem_results, output_files["cids"], force=args.force_browser)
                     else:
                         # Step 5c: Combine the cache keys
-                        combined_key = combine_pubchem_cache_keys(user_key, prog_key, args.combine)
-                        if combined_key:
+                        combine_result = combine_pubchem_cache_keys(user_key, prog_key, args.combine)
+                        if combine_result:
+                            combined_key, list_size = combine_result
                             url = f"https://pubchem.ncbi.nlm.nih.gov/#query={combined_key}"
                             print(f"Opening combined search in browser...")
                             webbrowser.open(url)

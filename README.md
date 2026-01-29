@@ -38,6 +38,15 @@ Once you see this window, return to the app and click "Continue.
 2. **Look up in PubChem**: Click the button and wait for the lookup to complete (this can take a while the first time)
 3. **Done!** You'll be redirected to the Search page. A Results tab shows a filtered table of your RUG chemicals that matched
 
+## Results Page
+
+After combining a search, the Results tab shows a DataTable of your matched chemicals with:
+
+- **Advanced property filters** - filter by molecular weight range (slider), molecular formula (substring), and storage location
+- **Save/Unsave** - bookmark filter results for later reference
+- **Compound info** - PubChem properties (MW, formula, IUPAC name) are fetched in the background and shown in the table
+- **Export** - download results as CSV
+
 ## Using the Search
 
 1. Go to [PubChem](https://pubchem.ncbi.nlm.nih.gov/) and search for anything (structures, properties, keywords)

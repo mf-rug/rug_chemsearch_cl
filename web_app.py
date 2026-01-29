@@ -27,15 +27,20 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, render_template_string, jsonify, request, redirect, url_for
+from flask import Flask, render_template_string, jsonify, request, redirect, url_for, Response
 
 # Import functions from the main script
 import logging
+
+import requests as _requests
 
 from extract_chemicals import (
     DATA_DIR,
     SNAPSHOTS_DIR,
     CID_CACHE_FILE,
+    RUG_TABLE_FILE,
+    COMPOUND_INFO_FILE,
+    LATEST_POINTER,
     list_snapshots,
     load_cid_cache,
     is_cid_cache_valid,
@@ -60,11 +65,15 @@ from extract_chemicals import (
     fetch_cids_from_listkey,
     save_filter_result,
     load_filter_results,
+    toggle_saved_filter,
+    delete_filter_result,
     load_compound_info,
     save_compound_info,
     fetch_compound_properties,
     load_app_searches,
     save_app_search,
+    save_app_search_with_metadata,
+    load_app_search_metadata,
     load_stale_searches,
     mark_search_as_stale,
 )
@@ -142,20 +151,16 @@ def start_compound_info_fetch(force=False):
     t.start()
 
 
-def _bg_repair_unmatched(review_mode=False):
-    """Background thread: repair unmatched entries via text search.
-
-    Args:
-        review_mode: If True, save to pending repairs for review instead of auto-accepting
-    """
-    from extract_chemicals import repair_unmatched_entries
+def _bg_repair_unmatched():
+    """Background thread: repair unmatched entries via text search (always review mode)."""
+    from extract_chemicals import repair_unmatched_entries, load_rug_table, save_cid_cache, load_cid_cache
+    import json as _json
 
     with _repair_lock:
         _repair_status["status"] = "running"
         _repair_status["processed"] = 0
         _repair_status["total"] = 0
         _repair_status["current_name"] = ""
-        _repair_status["review_mode"] = review_mode
 
     try:
         def progress_cb(processed, total, current_name):
@@ -166,18 +171,30 @@ def _bg_repair_unmatched(review_mode=False):
 
         loop = asyncio.new_event_loop()
         result = loop.run_until_complete(
-            repair_unmatched_entries(progress_cb, review_mode=review_mode)
+            repair_unmatched_entries(progress_cb)
         )
         loop.close()
 
         logger.info(f"Repair complete: {result}")
 
-        # Store results for review mode
-        if review_mode and result.get("repaired_entries"):
-            # Save pending repairs to file
+        # Mark failed entries on rug_table rows
+        failed_indices = result.get("failed_indices", [])
+        if failed_indices:
+            rug_table = load_rug_table()
+            if rug_table:
+                rows = rug_table.get("rows", [])
+                for ri in failed_indices:
+                    if 0 <= ri < len(rows):
+                        rows[ri]["_repair_status"] = "failed"
+                # Save updated rug_table
+                from extract_chemicals import RUG_TABLE_FILE
+                RUG_TABLE_FILE.write_text(_json.dumps(rug_table, indent=2, default=str))
+
+        # Always save pending repairs for review
+        if result.get("repaired_entries"):
             pending_file = DATA_DIR / "pending_repairs.json"
             with open(pending_file, 'w') as f:
-                json.dump(result, f, indent=2)
+                _json.dump(result, f, indent=2)
 
     except Exception:
         logger.exception("Repair task error")
@@ -186,12 +203,8 @@ def _bg_repair_unmatched(review_mode=False):
             _repair_status["status"] = "done"
 
 
-def start_repair_task(review_mode=False):
-    """Start background repair task if not already running.
-
-    Args:
-        review_mode: If True, repairs require manual approval
-    """
+def start_repair_task():
+    """Start background repair task if not already running."""
     with _repair_lock:
         if _repair_status["status"] == "running":
             return False
@@ -199,7 +212,7 @@ def start_repair_task(review_mode=False):
         _repair_status["processed"] = 0
         _repair_status["total"] = 0
 
-    t = threading.Thread(target=lambda: _bg_repair_unmatched(review_mode), daemon=True)
+    t = threading.Thread(target=_bg_repair_unmatched, daemon=True)
     t.start()
     return True
 
@@ -483,22 +496,135 @@ BASE_TEMPLATE = """
 
         /* Search page specific */
         .search-hero {
-            text-align: center;
-            padding: 30px 20px;
-            background: linear-gradient(135deg, var(--bg-light) 0%, var(--accent) 100%);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 16px;
+            background: var(--bg-light);
             border-radius: 12px;
             margin-bottom: 25px;
+            flex-wrap: wrap;
+            gap: 10px;
         }
         .search-hero h2 {
-            font-size: 1.4rem;
-            margin-bottom: 20px;
+            font-size: 1.1rem;
+            margin: 0;
             border: none;
             color: var(--text);
+        }
+        .search-hero .hero-buttons {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
         }
         .search-status {
             font-size: 0.9rem;
             color: var(--text-dim);
             margin-top: 15px;
+        }
+
+        /* Search input with inline draw button */
+        .search-input-wrapper {
+            position: relative;
+            display: flex;
+            flex: 1;
+        }
+        .search-input-wrapper input {
+            width: 100%;
+            padding: 14px 80px 14px 16px;
+            border-radius: 8px;
+            border: 1px solid var(--accent);
+            background: var(--bg);
+            color: var(--text);
+            font-size: 1.05rem;
+        }
+        .draw-btn {
+            position: absolute;
+            right: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: transparent;
+            border: none;
+            opacity: 0.5;
+            transition: opacity 0.2s;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1px;
+            padding: 4px 6px;
+            color: var(--text);
+        }
+        .draw-btn:hover { opacity: 0.85; }
+        .draw-btn .draw-label { font-size: 0.6rem; }
+
+        /* Mode selector pills */
+        .mode-selector {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            margin-top: 10px;
+        }
+        .mode-pill {
+            padding: 6px 14px;
+            border: 1px solid var(--accent);
+            border-radius: 6px;
+            background: transparent;
+            cursor: pointer;
+            color: var(--text);
+            font-size: 0.85rem;
+            transition: all 0.2s;
+        }
+        .mode-pill:hover { border-color: var(--highlight); }
+        .mode-pill.active {
+            background: var(--highlight);
+            color: white;
+            border-color: var(--highlight);
+        }
+
+        /* Structure drawer modal */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.7);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-content {
+            background: var(--bg-light);
+            border-radius: 8px;
+            max-width: 600px;
+            width: 90%;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px 20px;
+            border-bottom: 1px solid var(--accent);
+        }
+        .modal-header h3 { margin: 0; }
+        .modal-close {
+            background: none; border: none;
+            font-size: 1.5rem; cursor: pointer;
+            color: var(--text-dim);
+        }
+        .modal-close:hover { color: var(--highlight); }
+        .modal-footer {
+            padding: 15px 20px;
+            border-top: 1px solid var(--accent);
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        #kekule-composer-container {
+            padding: 10px;
+            background: white;
+            min-height: 400px;
         }
     </style>
     <!-- DataTables CSS -->
@@ -513,6 +639,12 @@ BASE_TEMPLATE = """
     <script src="https://cdn.datatables.net/buttons/3.2.0/js/buttons.colVis.min.js"></script>
     <script src="https://cdn.datatables.net/colreorder/2.0.4/js/dataTables.colReorder.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <!-- noUiSlider for range filtering -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/noUiSlider/15.8.1/nouislider.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/noUiSlider/15.8.1/nouislider.min.js"></script>
+    <!-- Kekule.js for chemical structure drawing -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/kekule/dist/themes/default/kekule.css">
+    <script src="https://cdn.jsdelivr.net/npm/kekule/dist/kekule.min.js"></script>
 </head>
 <body>
     <header>
@@ -603,23 +735,39 @@ SEARCH_TEMPLATE = """
 
 <div class="search-hero">
     <h2>Search Your {{ cid_count }} Chemicals</h2>
+    <div class="hero-buttons">
+        <a href="{{ url_for('results_page', filter_id='all') }}" class="btn btn-success">View All</a>
+        <button class="btn" onclick="window.open('https://pubchem.ncbi.nlm.nih.gov/', '_blank')">
+            Open PubChem
+        </button>
+    </div>
+</div>
 
-    {% if selected_search %}
-    <button class="btn btn-success btn-large" onclick="combineSelectedSearch('AND', this)" id="btn-main-search">
-        Find matching chemicals
-    </button>
-    <div class="search-status">
-        Searching for: <strong>{{ selected_search.name }}</strong>
-        <span class="text-dim">({{ selected_search.list_size|default('?') }} results)</span>
+<div class="card">
+    <h2>Search PubChem Directly</h2>
+    <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px;">
+        <div class="search-input-wrapper">
+            <input type="text" id="direct-search-input" placeholder="Enter name, CAS, or keyword..."
+                   onkeydown="if(event.key==='Enter'){directPubchemSearch(document.getElementById('direct-search-btn'));}">
+            <button class="draw-btn" onclick="openStructureDrawer()" title="Draw structure">
+                <svg width="20" height="22" viewBox="0 0 20 22" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <path d="M10 1L18.66 5.5V14.5L10 19L1.34 14.5V5.5L10 1Z"/>
+                </svg>
+                <span class="draw-label">Draw</span>
+            </button>
+        </div>
+        <button class="btn btn-success" id="direct-search-btn" onclick="directPubchemSearch(this)">Search</button>
     </div>
-    {% else %}
-    <button class="btn btn-large" onclick="window.open('https://pubchem.ncbi.nlm.nih.gov/', '_blank')">
-        Start a New Search on PubChem
-    </button>
-    <div class="search-status">
-        Search for any structure, property, or keyword on PubChem, then come back here.
+    <div class="mode-selector">
+        <button class="mode-pill active" data-mode="name" onclick="selectMode('name', this)">Name / CAS</button>
+        <button class="mode-pill" data-mode="smiles" onclick="selectMode('smiles', this)">SMILES</button>
+        <button class="mode-pill" data-mode="substructure" onclick="selectMode('substructure', this)">Substructure</button>
+        <button class="mode-pill" data-mode="superstructure" onclick="selectMode('superstructure', this)">Superstructure</button>
+        <button class="mode-pill" data-mode="similarity" onclick="selectMode('similarity', this)">Similarity</button>
     </div>
-    {% endif %}
+    <p class="text-dim" style="font-size: 0.85rem; margin-top: 10px;" id="search-mode-hint">
+        Search by name, CAS number, or keyword. Results will appear in the list below.
+    </p>
 </div>
 
 <div class="card">
@@ -697,6 +845,27 @@ SEARCH_TEMPLATE = """
         <button class="btn" onclick="window.open('https://pubchem.ncbi.nlm.nih.gov/', '_blank')">
             Open PubChem
         </button>
+    </div>
+</div>
+
+<!-- Structure Drawer Modal -->
+<div id="structure-drawer-modal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Draw Structure</h3>
+            <button class="modal-close" onclick="closeStructureDrawer()">&times;</button>
+        </div>
+        <div id="kekule-composer-container"></div>
+        <div class="modal-footer">
+            <select id="structure-search-type" style="padding: 8px 12px; border-radius: 4px; border: 1px solid var(--accent); background: var(--bg); color: var(--text); font-size: 0.9rem;">
+                <option value="substructure">Substructure search</option>
+                <option value="superstructure">Superstructure search</option>
+                <option value="similarity">Similarity search</option>
+                <option value="smiles">Exact match</option>
+            </select>
+            <button class="btn btn-success" onclick="useDrawnStructure()">Use Structure</button>
+            <button class="btn btn-secondary" onclick="closeStructureDrawer()">Cancel</button>
+        </div>
     </div>
 </div>
 {% endif %}
@@ -885,12 +1054,9 @@ async function combineSelectedSearch(operation, btn) {
             await refreshHistory();
         } else if (data.error) {
             alert('Error: ' + data.error);
-        } else if (data.pubchem_url) {
-            window.open(data.pubchem_url, '_blank');
-            if (data.filter_id) {
-                window.location.href = '/results?filter_id=' + data.filter_id;
-                return;
-            }
+        } else if (data.filter_id) {
+            window.location.href = '/results?filter_id=' + data.filter_id;
+            return;
         }
     } catch (e) {
         alert('Error: ' + e.message);
@@ -926,6 +1092,71 @@ function toggleSection(id) {
     } else {
         content.classList.add('open');
         icon.textContent = '- collapse';
+    }
+}
+
+// --- Direct PubChem search ---
+const SEARCH_MODE_INFO = {
+    'name': {placeholder: 'Enter name, CAS, or keyword...', hint: 'Search by name, CAS number, or keyword. Results will appear in the list below.'},
+    'smiles': {placeholder: 'Enter SMILES or draw...', hint: 'Find exact compound match by SMILES notation.'},
+    'substructure': {placeholder: 'Enter SMILES or draw...', hint: 'Find compounds containing this structure as a substructure.'},
+    'superstructure': {placeholder: 'Enter SMILES or draw...', hint: 'Find compounds where query is a superstructure (contains the target).'},
+    'similarity': {placeholder: 'Enter SMILES or draw...', hint: 'Find compounds with similar 2D structure (Tanimoto similarity).'},
+};
+
+let currentSearchMode = 'name';
+
+function selectMode(mode, pill) {
+    currentSearchMode = mode;
+    document.querySelectorAll('.mode-pill').forEach(p => p.classList.remove('active'));
+    pill.classList.add('active');
+    updateSearchPlaceholder();
+}
+
+function updateSearchPlaceholder() {
+    const mode = currentSearchMode;
+    const input = document.getElementById('direct-search-input');
+    const hint = document.getElementById('search-mode-hint');
+    const info = SEARCH_MODE_INFO[mode] || SEARCH_MODE_INFO['name'];
+    input.placeholder = info.placeholder;
+    hint.textContent = info.hint;
+}
+
+async function directPubchemSearch(btn) {
+    const input = document.getElementById('direct-search-input');
+    const query = input.value.trim();
+    const mode = currentSearchMode;
+
+    if (!query) {
+        alert('Enter a search query');
+        return;
+    }
+
+    btn.disabled = true;
+    const originalText = btn.textContent;
+    btn.innerHTML = '<span class="loading"></span> Searching...';
+
+    try {
+        const resp = await fetch('/api/pubchem-search', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({query, mode})
+        });
+        const data = await resp.json();
+
+        if (data.success) {
+            input.value = '';
+            await refreshHistory();
+            // Auto-select the new search
+            selectEntry(data.cache_key);
+        } else {
+            alert(data.error || 'Search failed');
+        }
+    } catch (e) {
+        alert('Error: ' + e.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
     }
 }
 
@@ -965,6 +1196,71 @@ document.addEventListener('DOMContentLoaded', () => {
 // Cleanup on page leave
 window.addEventListener('beforeunload', () => {
     if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+});
+
+// --- Structure Drawer (Kekule.js) ---
+let composer = null;
+
+function openStructureDrawer() {
+    const modal = document.getElementById('structure-drawer-modal');
+    modal.style.display = 'flex';
+
+    // Initialize composer if not already done
+    if (!composer) {
+        const container = document.getElementById('kekule-composer-container');
+        composer = new Kekule.Editor.Composer(container);
+        composer.setDimension('100%', '400px');
+    }
+}
+
+function closeStructureDrawer() {
+    document.getElementById('structure-drawer-modal').style.display = 'none';
+}
+
+function useDrawnStructure() {
+    if (!composer) return;
+
+    const mol = composer.getChemObj();
+    if (!mol) {
+        alert('Please draw a structure first');
+        return;
+    }
+
+    let smiles;
+    try {
+        smiles = Kekule.IO.saveFormatData(mol, 'smi');
+    } catch (e) {
+        alert('Could not convert structure to SMILES: ' + e.message);
+        return;
+    }
+
+    if (!smiles) {
+        alert('Could not convert structure to SMILES');
+        return;
+    }
+
+    // Populate the search input
+    document.getElementById('direct-search-input').value = smiles;
+
+    // Set the search mode based on drawer dropdown selection
+    const searchType = document.getElementById('structure-search-type').value;
+    currentSearchMode = searchType;
+    document.querySelectorAll('.mode-pill').forEach(p => {
+        p.classList.toggle('active', p.dataset.mode === searchType);
+    });
+    updateSearchPlaceholder();
+
+    closeStructureDrawer();
+}
+
+// Close modal on escape key or clicking outside
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeStructureDrawer();
+});
+
+document.addEventListener('click', (e) => {
+    const modal = document.getElementById('structure-drawer-modal');
+    if (e.target === modal) closeStructureDrawer();
 });
 </script>
 {% endblock %}
@@ -1055,6 +1351,29 @@ RESULTS_TEMPLATE = """
         overflow-x: auto;
         width: 100%;
     }
+
+    .print-header { display: none; }
+
+    #mw-slider { margin: 0 8px; }
+    #mw-slider .noUi-connect { background: var(--highlight); }
+    #mw-slider .noUi-handle { border-color: var(--highlight); background: var(--card-bg); }
+    #mw-slider .noUi-tooltip { background: var(--card-bg); color: var(--text); border-color: var(--border); font-size: 0.75rem; }
+    #mw-slider .noUi-pips { color: var(--text-dim); }
+    #mw-slider .noUi-marker { background: var(--border); }
+    #mw-slider .noUi-value { color: var(--text-dim); font-size: 0.7rem; }
+
+    @media print {
+        nav, .dt-buttons, #advanced-filters, .dataTables_length, .dataTables_filter,
+        .dataTables_info, .dataTables_paginate, .btn, .btn-secondary, select,
+        label.text-dim, #compound-info-badge, .alert { display: none !important; }
+        .print-header { display: block !important; }
+        body, .card, .table-responsive, table { background: white !important; color: black !important; }
+        .structure-large { display: none !important; }
+        .structure-cell:hover .structure-large { display: none !important; }
+        .structure-cell:hover .structure-thumb { visibility: visible !important; }
+        tr { page-break-inside: avoid; }
+        * { color: black !important; border-color: #ccc !important; }
+    }
 </style>
 
 {% if not rug_table %}
@@ -1080,10 +1399,21 @@ RESULTS_TEMPLATE = """
         </div>
         <div style="display: flex; gap: 10px; align-items: center;">
             <span id="compound-info-badge" class="text-dim" style="font-size: 0.8rem;"></span>
+            {% if current_filter.id and current_filter.id != 'all' %}
+            <button id="save-toggle-btn" class="btn btn-secondary" style="font-size: 0.85rem;" onclick="toggleSave()">
+                {% if current_filter.get('saved') %}&#9733; Saved{% else %}&#9734; Save{% endif %}
+            </button>
+            {% endif %}
             {% if current_filter.pubchem_url %}
             <a href="{{ current_filter.pubchem_url }}" target="_blank" class="btn btn-secondary" style="font-size: 0.85rem;">Open on PubChem</a>
             {% endif %}
         </div>
+    </div>
+
+    <div class="print-header">
+        <h2>Chemical Report: {{ current_filter.search_name }}</h2>
+        <p>{{ current_filter.match_count }} chemicals | {{ current_filter.created[:10] if current_filter.created else '' }}</p>
+        <hr>
     </div>
 
     {% if filter_results|length > 0 %}
@@ -1093,14 +1423,57 @@ RESULTS_TEMPLATE = """
             <option value="all" {{ 'selected' if current_filter and current_filter.id == 'all' else '' }}>
                 All Chemicals ({{ rug_table.rows|length if rug_table else 0 }} total)
             </option>
-            {% for fr in filter_results %}
-            <option value="{{ fr.id }}" {{ 'selected' if current_filter and fr.id == current_filter.id else '' }}>
-                {{ fr.search_name }} ({{ fr.operation }}) — {{ fr.match_count }} matches
-            </option>
-            {% endfor %}
+            {% set saved_filters = filter_results|selectattr('saved', 'defined')|selectattr('saved')|list %}
+            {% set recent_filters = filter_results|rejectattr('saved', 'defined')|list + filter_results|selectattr('saved', 'defined')|rejectattr('saved')|list %}
+            {% if saved_filters %}
+            <optgroup label="Saved">
+                {% for fr in saved_filters %}
+                <option value="{{ fr.id }}" {{ 'selected' if current_filter and fr.id == current_filter.id else '' }}>
+                    &#9733; {{ fr.search_name }} ({{ fr.operation }}) — {{ fr.match_count }} matches
+                </option>
+                {% endfor %}
+            </optgroup>
+            {% endif %}
+            {% if recent_filters %}
+            <optgroup label="Recent">
+                {% for fr in recent_filters %}
+                <option value="{{ fr.id }}" {{ 'selected' if current_filter and fr.id == current_filter.id else '' }}>
+                    {{ fr.search_name }} ({{ fr.operation }}) — {{ fr.match_count }} matches
+                </option>
+                {% endfor %}
+            </optgroup>
+            {% endif %}
         </select>
     </div>
     {% endif %}
+
+    <div id="advanced-filters" style="margin-bottom: 15px; padding: 12px 15px; border: 1px solid var(--border); border-radius: 6px;">
+        <div style="display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-end;">
+            <div style="min-width: 280px; flex: 1;">
+                <label class="text-dim" style="font-size: 0.8rem; display: block; margin-bottom: 8px;">Molecular Weight</label>
+                <div id="mw-slider" style="margin-bottom: 35px;"></div>
+            </div>
+            <div>
+                <label class="text-dim" style="font-size: 0.8rem; display: block; margin-bottom: 4px;">Formula</label>
+                <input type="text" id="formula-filter" placeholder="e.g. C6" style="width: 100px; font-size: 0.85rem; padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text);">
+            </div>
+            {% if unique_locations %}
+            <div>
+                <label class="text-dim" style="font-size: 0.8rem; display: block; margin-bottom: 4px;">Location</label>
+                <select id="location-filter" style="font-size: 0.85rem; padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text);">
+                    <option value="">All locations</option>
+                    {% for loc in unique_locations %}
+                    <option value="{{ loc }}">{{ loc }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            {% endif %}
+            <div style="display: flex; gap: 6px;">
+                <button class="btn" style="font-size: 0.8rem;" id="apply-filters-btn">Apply Filters</button>
+                <button class="btn btn-secondary" style="font-size: 0.8rem;" id="clear-filters-btn">Clear</button>
+            </div>
+        </div>
+    </div>
 
     {% if filtered_rows %}
     <div class="table-responsive">
@@ -1130,7 +1503,7 @@ RESULTS_TEMPLATE = """
                             {% else %}-{% endif %}
                         {% elif col == 'Name' %}{{ row._ci.get('title', '') or '-' }}{% if row._repair_status == 'repaired' %} <span class="badge badge-warning" title="Found via text search (repaired)" style="margin-left: 4px; font-size: 0.7rem;">&#128295;</span>{% endif %}
                         {% elif col == 'EntryName' %}{{ row.get('Name', '') or '-' }}
-                        {% elif col == 'CAS' %}{{ row.get('Casnr', '') or '-' }}
+                        {% elif col == 'CAS' %}{% if row.get('_original_cas') %}<s>{{ row._original_cas }}</s> {{ row.get('Casnr', '') }}{% else %}{{ row.get('Casnr', '') or '-' }}{% endif %}
                         {% elif col == 'Formula' %}{{ row._ci.get('formula', '') or row.get('Formula', '') or '-' }}
                         {% elif col == 'MW' %}{{ row._ci.get('mw', '') or '-' }}
                         {% elif col == 'SMILES' %}<span class="smiles-cell" title="{{ row._ci.get('smiles', '') }}">{{ row._ci.get('smiles', '') or '-' }}</span>
@@ -1233,27 +1606,34 @@ $(document).ready(function() {
                 columns: ':not(.no-export)'
             },
             {
-                extend: 'csvHtml5',
-                text: 'Export CSV',
-                title: '{{ current_filter.search_name if current_filter else "Results" }} - {{ current_filter.created[:10] if current_filter else "" }}',
-                exportOptions: {
-                    columns: ':visible:not(.col-Structure)'
-                }
-            },
-            {
-                extend: 'excelHtml5',
-                text: 'Export Excel',
-                title: '{{ current_filter.search_name if current_filter else "Results" }} - {{ current_filter.created[:10] if current_filter else "" }}',
-                exportOptions: {
-                    columns: ':visible:not(.col-Structure)'
-                }
-            },
-            {
-                extend: 'copyHtml5',
-                text: 'Copy',
-                exportOptions: {
-                    columns: ':visible:not(.col-Structure)'
-                }
+                extend: 'collection',
+                text: 'Export',
+                buttons: [
+                    {
+                        extend: 'csvHtml5',
+                        text: 'CSV',
+                        title: '{{ current_filter.search_name if current_filter else "Results" }} - {{ current_filter.created[:10] if current_filter else "" }}',
+                        exportOptions: { columns: ':visible:not(.col-Structure)' }
+                    },
+                    {
+                        extend: 'excelHtml5',
+                        text: 'Excel',
+                        title: '{{ current_filter.search_name if current_filter else "Results" }} - {{ current_filter.created[:10] if current_filter else "" }}',
+                        exportOptions: { columns: ':visible:not(.col-Structure)' }
+                    },
+                    {
+                        extend: 'copyHtml5',
+                        text: 'Copy to Clipboard',
+                        exportOptions: { columns: ':visible:not(.col-Structure)' }
+                    },
+                    {
+                        text: 'Print / PDF',
+                        action: function(e, dt) {
+                            dt.page.len(-1).draw();
+                            setTimeout(function() { window.print(); }, 500);
+                        }
+                    }
+                ]
             }
         ],
         stateSave: true,
@@ -1308,6 +1688,134 @@ async function pollCompoundInfo() {
     } catch(e) {}
 }
 document.addEventListener('DOMContentLoaded', pollCompoundInfo);
+
+// --- Save/Unsave toggle ---
+console.log('[Script] toggleSave and filter code starting to parse');
+function toggleSave() {
+    const filterId = '{{ current_filter.id if current_filter else "" }}';
+    if (!filterId || filterId === 'all') return;
+    const isSaved = {{ 'true' if current_filter and current_filter.get('saved') else 'false' }};
+    const action = isSaved ? 'unsave' : 'save';
+    fetch('/api/filter-results/' + filterId + '/' + action, { method: 'POST' })
+        .then(r => r.json())
+        .then(data => { if (data.success) location.reload(); });
+}
+
+// --- Advanced property filters ---
+console.log('[Filters] Script tag loaded');
+console.log('[Filters] jQuery?', typeof $);
+console.log('[Filters] noUiSlider?', typeof noUiSlider);
+console.log('[Filters] DataTable?', typeof $.fn.dataTable);
+
+window._filterState = { mwLo: null, mwHi: null, formula: '', location: '' };
+window._fIdx = { mw: -1, formula: -1, loc: -1 };
+window._mwSlider = null;
+
+$(document).ready(function() {
+    var dt = $('#results-data-table');
+    if (!dt.length) { console.log('[Filters] No results table found, skipping'); return; }
+
+    var tbl = dt.DataTable();
+    var headers = [];
+    tbl.columns().header().each(function(h) { headers.push($(h).text().trim()); });
+    window._fIdx.mw = headers.indexOf('MW');
+    window._fIdx.formula = headers.indexOf('Formula');
+    window._fIdx.loc = headers.indexOf('Location');
+    console.log('[Filters] Column indices — MW:', window._fIdx.mw, 'Formula:', window._fIdx.formula, 'Location:', window._fIdx.loc);
+
+    // --- noUiSlider for MW ---
+    var sliderEl = document.getElementById('mw-slider');
+    if (sliderEl && window._fIdx.mw >= 0) {
+        var dataMin = Infinity, dataMax = -Infinity;
+        tbl.column(window._fIdx.mw).data().each(function(val) {
+            var n = parseFloat(val);
+            if (!isNaN(n)) {
+                if (n < dataMin) dataMin = n;
+                if (n > dataMax) dataMax = n;
+            }
+        });
+        if (!isFinite(dataMin)) { dataMin = 0; dataMax = 1000; }
+        dataMin = Math.floor(dataMin);
+        dataMax = Math.ceil(dataMax);
+        window._mwDataMin = dataMin;
+        window._mwDataMax = dataMax;
+        window._filterState.mwLo = dataMin;
+        window._filterState.mwHi = dataMax;
+
+        noUiSlider.create(sliderEl, {
+            start: [dataMin, dataMax],
+            connect: true,
+            range: { 'min': dataMin, 'max': dataMax },
+            step: 1,
+            tooltips: [
+                { to: function(v) { return Math.round(v); } },
+                { to: function(v) { return Math.round(v); } }
+            ],
+            pips: {
+                mode: 'count',
+                values: 5,
+                density: 4,
+                format: { to: function(v) { return Math.round(v); } }
+            }
+        });
+        window._mwSlider = sliderEl.noUiSlider;
+        console.log('[Filters] MW slider created, range:', dataMin, '-', dataMax);
+    } else {
+        console.log('[Filters] MW slider skipped — element:', !!sliderEl, 'mwIdx:', window._fIdx.mw);
+    }
+
+    // --- Register DataTables custom search function ---
+    $.fn.dataTable.ext.search.push(function(settings, data) {
+        if (settings.nTable.id !== 'results-data-table') return true;
+        var fs = window._filterState;
+        var idx = window._fIdx;
+
+        if (idx.mw >= 0 && fs.mwLo !== null && fs.mwHi !== null) {
+            if (fs.mwLo > window._mwDataMin || fs.mwHi < window._mwDataMax) {
+                var mw = parseFloat(data[idx.mw]);
+                if (isNaN(mw) || mw < fs.mwLo || mw > fs.mwHi) return false;
+            }
+        }
+        if (idx.formula >= 0 && fs.formula) {
+            if ((data[idx.formula] || '').toLowerCase().indexOf(fs.formula) === -1) return false;
+        }
+        if (idx.loc >= 0 && fs.location) {
+            if ((data[idx.loc] || '').trim() !== fs.location) return false;
+        }
+        return true;
+    });
+    console.log('[Filters] Custom search function registered');
+
+    // --- Button handlers ---
+    $('#apply-filters-btn').on('click', function() {
+        console.log('[Filters] Apply clicked');
+        if (window._mwSlider) {
+            var vals = window._mwSlider.get();
+            window._filterState.mwLo = parseFloat(vals[0]);
+            window._filterState.mwHi = parseFloat(vals[1]);
+            console.log('[Filters] MW range:', window._filterState.mwLo, '-', window._filterState.mwHi);
+        }
+        window._filterState.formula = ($('#formula-filter').val() || '').toLowerCase();
+        window._filterState.location = $('#location-filter').val() || '';
+        console.log('[Filters] Formula:', window._filterState.formula, 'Location:', window._filterState.location);
+        tbl.draw();
+        console.log('[Filters] Table redrawn');
+    });
+
+    $('#clear-filters-btn').on('click', function() {
+        console.log('[Filters] Clear clicked');
+        if (window._mwSlider) {
+            window._mwSlider.set([window._mwDataMin, window._mwDataMax]);
+        }
+        $('#formula-filter').val('');
+        $('#location-filter').val('');
+        window._filterState = { mwLo: window._mwDataMin, mwHi: window._mwDataMax, formula: '', location: '' };
+        tbl.draw();
+        console.log('[Filters] Filters cleared, table redrawn');
+    });
+
+    console.log('[Filters] Button handlers bound');
+});
 </script>
 {% endblock %}
 """
@@ -1325,7 +1833,7 @@ SETUP_TEMPLATE = """
         <div class="stat-label">Matched in PubChem</div>
     </div>
     <div class="stat">
-        <div class="stat-value">{{ cache_stats.not_found if cache_stats else '-' }}</div>
+        <div class="stat-value">{{ no_match_count if cache_stats else '-' }}</div>
         <div class="stat-label">No PubChem Match</div>
     </div>
     <div class="stat">
@@ -1336,10 +1844,33 @@ SETUP_TEMPLATE = """
 
 {% if setup_complete %}
 <div class="alert alert-success">
-    <p><strong>Setup Complete!</strong> You have {{ cache_stats.found_cids }} chemicals ready to search.</p>
+    <p><strong>Setup Complete!</strong> You have {{ cache_stats.found_cids }} chemicals ready to search.
+    {% if no_match_count > 0 %} {{ no_match_count }} entries had no PubChem match &mdash; you can try to <a href="#no-match" onclick="document.getElementById('no-match').classList.add('open'); document.getElementById('no-match-icon').textContent='- collapse';" style="color: inherit; text-decoration: underline;">repair them</a> below.{% endif %}</p>
     <a href="{{ url_for('search') }}" class="btn btn-success" style="margin-top: 10px;">Go to Search</a>
 </div>
+{% elif latest_snapshot and not cache_valid %}
+<div class="alert" style="background: var(--accent); border: 1px solid var(--warning); border-radius: 6px; padding: 15px; margin-bottom: 20px;">
+    <p><strong>Next step:</strong> Database imported. Now look up your chemicals in PubChem (Step 2 below).</p>
+</div>
 {% endif %}
+
+<div class="card">
+    <h2>Quick Import</h2>
+    <p style="margin-bottom: 15px;">Import a pre-built database bundle. Skips Steps 1 &amp; 2.</p>
+    <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 15px;">
+        <input type="text" id="import-url" placeholder="Paste Google Drive or direct URL..."
+               style="flex: 1; padding: 8px 12px; border-radius: 4px; border: 1px solid var(--accent); background: var(--bg); color: var(--text); font-size: 0.9rem;">
+        <button class="btn" onclick="importFromUrl(this)">Import from URL</button>
+    </div>
+    <div style="display: flex; gap: 10px; align-items: center;">
+        <span class="text-dim">Or import from file:</span>
+        <input type="file" accept=".json" onchange="importFromFile(this)" style="font-size: 0.85rem;">
+    </div>
+    <p class="text-dim" style="margin-top: 10px; font-size: 0.85rem;">Or set up manually below (Steps 1 &amp; 2).</p>
+    <div id="import-status" style="margin-top: 10px; display: none;">
+        <p><span class="loading"></span> <span id="import-status-text">Importing...</span></p>
+    </div>
+</div>
 
 <div class="card">
     <h2>Step 1: Import Chemicals Database</h2>
@@ -1402,6 +1933,15 @@ SETUP_TEMPLATE = """
         <span class="toggle-icon" id="manage-exports-icon">+ expand</span>
     </div>
     <div class="collapsible-content" id="manage-exports">
+        {% if setup_complete %}
+        <div style="margin-bottom: 20px;">
+            <h3 style="font-size: 0.95rem; color: var(--text-dim); margin-bottom: 10px;">Export Database Bundle</h3>
+            <p class="text-dim" style="margin-bottom: 10px; font-size: 0.85rem;">Download a bundle containing all data. Share with others to skip Steps 1 &amp; 2.</p>
+            <form action="{{ url_for('export_database') }}" method="post">
+                <button type="submit" class="btn btn-secondary">Export Database</button>
+            </form>
+        </div>
+        {% endif %}
         <div style="margin-bottom: 20px;">
             <h3 style="font-size: 0.95rem; color: var(--text-dim); margin-bottom: 10px;">Upload HTML File</h3>
             <form action="{{ url_for('upload_snapshot') }}" method="post" enctype="multipart/form-data" style="display: flex; gap: 10px; align-items: center;">
@@ -1534,11 +2074,8 @@ SETUP_TEMPLATE = """
                 <strong>Try Repair:</strong> Search PubChem using entry names to find matches that failed CAS lookup.
             </p>
             <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-                <button class="btn btn-success" id="btn-repair-auto" onclick="startRepair('auto')">
-                    Auto-Accept Repairs
-                </button>
-                <button class="btn btn-secondary" id="btn-repair-review" onclick="startRepair('review')">
-                    Repair with Review
+                <button class="btn btn-success" id="btn-repair" onclick="startRepair()">
+                    Repair Unmatched Entries
                 </button>
             </div>
             <div id="repair-status-box" style="display: none; margin-top: 10px; display: none; align-items: center;">
@@ -1563,20 +2100,18 @@ SETUP_TEMPLATE = """
                     {% for row in no_match_rows %}
                     <tr>
                         <td>{{ row.get('Name', '-') }}</td>
-                        <td class="mono">{{ row.get('Casnr', '-') }}</td>
+                        <td class="mono">{% if row.get('_original_cas') %}<s>{{ row._original_cas }}</s> {{ row.get('Casnr', '-') }}{% else %}{{ row.get('Casnr', '-') }}{% endif %}</td>
                         <td>{{ row.get('Formula', '-') }}</td>
                         <td>{{ row.get('Location', '-') }}</td>
                         <td>{{ row.get('Pot', '-') }}</td>
                         <td>
-                            {% set repair_info = get_repair_info(row.get('Casnr', '')) %}
-                            {% if repair_info.attempted %}
-                                {% if repair_info.success %}
+                            {% set rs = row.get('_repair_status', '') %}
+                            {% if rs == 'repaired' %}
                                 <span class="badge badge-success" title="Repaired via text search" style="font-size: 0.75rem;">&#10003; Repaired</span>
-                                {% else %}
+                            {% elif rs == 'failed' %}
                                 <span class="badge badge-warning" title="Repair attempted, no match found" style="font-size: 0.75rem;">&#10007; No Match</span>
-                                {% endif %}
                             {% else %}
-                            <span class="text-dim">Not attempted</span>
+                                <span class="text-dim">Not attempted</span>
                             {% endif %}
                         </td>
                     </tr>
@@ -1605,7 +2140,8 @@ SETUP_TEMPLATE = """
                         <tr>
                             <th style="width: 30px;"></th>
                             <th>Entry Name</th>
-                            <th>CAS</th>
+                            <th>Old CAS</th>
+                            <th>Real CAS</th>
                             <th>Found CID</th>
                             <th>Preview</th>
                         </tr>
@@ -1753,21 +2289,14 @@ function filterTable() {
 }
 
 // ---- Repair unmatched entries ----
-async function startRepair(mode) {
-    const reviewMode = mode === 'review';
-    const confirmMsg = reviewMode
-        ? 'This will search PubChem for matches and let you review them before saving.\\n\\nContinue?'
-        : 'This will automatically accept all PubChem matches found.\\n\\nContinue?';
-
-    if (!confirm(confirmMsg)) return;
+async function startRepair() {
+    if (!confirm('This will search PubChem for matches and let you review them before saving.\\n\\nContinue?')) return;
 
     const statusBox = document.getElementById('repair-status-box');
     const statusText = document.getElementById('repair-status-text');
-    const btnAuto = document.getElementById('btn-repair-auto');
-    const btnReview = document.getElementById('btn-repair-review');
+    const btn = document.getElementById('btn-repair');
 
-    btnAuto.disabled = true;
-    btnReview.disabled = true;
+    btn.disabled = true;
     statusBox.style.display = 'flex';
     statusText.textContent = 'Starting repair...';
 
@@ -1775,33 +2304,30 @@ async function startRepair(mode) {
         const startResp = await fetch('/api/repair-unmatched/start', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({review_mode: reviewMode})
+            body: JSON.stringify({})
         });
         const startData = await startResp.json();
 
         if (startData.error) {
             alert('Error: ' + startData.error);
-            btnAuto.disabled = false;
-            btnReview.disabled = false;
+            btn.disabled = false;
             statusBox.style.display = 'none';
             return;
         }
 
-        pollRepairStatus(reviewMode);
+        pollRepairStatus();
     } catch (e) {
         alert('Error: ' + e.message);
-        btnAuto.disabled = false;
-        btnReview.disabled = false;
+        btn.disabled = false;
         statusBox.style.display = 'none';
     }
 }
 
-async function pollRepairStatus(reviewMode) {
+async function pollRepairStatus() {
     const statusBox = document.getElementById('repair-status-box');
     const statusText = document.getElementById('repair-status-text');
     const spinner = document.getElementById('repair-spinner');
-    const btnAuto = document.getElementById('btn-repair-auto');
-    const btnReview = document.getElementById('btn-repair-review');
+    const btn = document.getElementById('btn-repair');
 
     try {
         const resp = await fetch('/api/repair-unmatched/status');
@@ -1809,35 +2335,27 @@ async function pollRepairStatus(reviewMode) {
 
         if (data.status === 'running') {
             statusText.textContent = 'Repairing... ' + data.progress;
-            setTimeout(() => pollRepairStatus(reviewMode), 2000);
+            setTimeout(() => pollRepairStatus(), 2000);
         } else if (data.status === 'done') {
             spinner.style.display = 'none';
-            if (reviewMode) {
-                statusText.textContent = 'Repair scan complete! Loading results...';
-                setTimeout(async () => {
-                    const hasPending = await loadPendingRepairs();
-                    if (hasPending) {
-                        statusBox.style.display = 'none';
-                        document.getElementById('review-repairs-card').scrollIntoView({behavior: 'smooth'});
-                    } else {
-                        statusText.textContent = 'No matches found.';
-                    }
-                    btnAuto.disabled = false;
-                    btnReview.disabled = false;
-                }, 500);
-            } else {
-                statusText.textContent = 'Repair complete! Reloading page...';
-                setTimeout(() => window.location.reload(), 1500);
-            }
+            statusText.textContent = 'Repair scan complete! Loading results...';
+            setTimeout(async () => {
+                const hasPending = await loadPendingRepairs();
+                if (hasPending) {
+                    statusBox.style.display = 'none';
+                    document.getElementById('review-repairs-card').scrollIntoView({behavior: 'smooth'});
+                } else {
+                    statusText.textContent = 'No matches found.';
+                }
+                btn.disabled = false;
+            }, 500);
         } else {
             statusBox.style.display = 'none';
-            btnAuto.disabled = false;
-            btnReview.disabled = false;
+            btn.disabled = false;
         }
     } catch (e) {
         statusText.textContent = 'Error checking status';
-        btnAuto.disabled = false;
-        btnReview.disabled = false;
+        btn.disabled = false;
     }
 }
 
@@ -1860,9 +2378,10 @@ function displayPendingRepairs(entries) {
     const tbody = document.getElementById('pending-repairs-body');
     tbody.innerHTML = entries.map(entry =>
         '<tr>' +
-        '<td><input type="checkbox" class="repair-checkbox" value="' + entry.cas + '" checked></td>' +
+        '<td><input type="checkbox" class="repair-checkbox" value="' + entry.row_index + '" checked></td>' +
         '<td>' + entry.name + '</td>' +
         '<td class="mono">' + entry.cas + '</td>' +
+        '<td class="mono">' + (entry.real_cas || '<span class="text-dim">-</span>') + '</td>' +
         '<td><a href="https://pubchem.ncbi.nlm.nih.gov/compound/' + entry.cid + '" target="_blank" class="mono" style="color: var(--success);">' + entry.cid + '</a></td>' +
         '<td><img src="https://pubchem.ncbi.nlm.nih.gov/image/imgsrv.fcgi?cid=' + entry.cid + '&t=s" style="width: 40px; height: 40px; background: white; border-radius: 2px;" alt="structure"></td>' +
         '</tr>'
@@ -1903,8 +2422,62 @@ async function applySelectedRepairs(btn) {
     }
 }
 
+// --- Quick Import ---
+async function importFromUrl(btn) {
+    const url = document.getElementById('import-url').value.trim();
+    if (!url) { alert('Enter a URL'); return; }
+    btn.disabled = true; btn.textContent = 'Importing...';
+    try {
+        const resp = await fetch('/api/import-database-url', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({url})
+        });
+        const data = await resp.json();
+        if (data.success) {
+            window.location.reload();
+        } else if (data.auth_required) {
+            window.open(data.url, '_blank');
+            alert('Authentication required. The file is opening in your browser.\\nDownload it, then use the file picker to import.');
+            btn.disabled = false; btn.textContent = 'Import from URL';
+        } else {
+            alert('Import failed: ' + data.error);
+            btn.disabled = false; btn.textContent = 'Import from URL';
+        }
+    } catch (e) {
+        alert('Import failed: ' + e.message);
+        btn.disabled = false; btn.textContent = 'Import from URL';
+    }
+}
+
+async function importFromFile(input) {
+    const file = input.files[0];
+    if (!file) return;
+    const statusDiv = document.getElementById('import-status');
+    const statusText = document.getElementById('import-status-text');
+    statusDiv.style.display = '';
+    statusText.textContent = 'Reading file...';
+    try {
+        const text = await file.text();
+        statusText.textContent = 'Importing...';
+        const resp = await fetch('/api/import-database', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: text
+        });
+        const data = await resp.json();
+        if (data.success) { window.location.reload(); }
+        else { alert('Import failed: ' + data.error); statusDiv.style.display = 'none'; }
+    } catch (e) {
+        alert('Import failed: ' + e.message);
+        statusDiv.style.display = 'none';
+    }
+}
+
 // Check for pending repairs on page load
 document.addEventListener('DOMContentLoaded', loadPendingRepairs);
+
+
 </script>
 {% endblock %}
 """
@@ -1966,18 +2539,11 @@ def search():
         has_cids = len(cids) > 0
         cid_count = len(cids)
 
-    # Get the first search from history for the hero
-    selected_search = None
-    history = get_pubchem_history_details()
-    if history:
-        selected_search = history[0]
-
     return render("search",
         title="Search",
         active_page="search",
         has_cids=has_cids,
         cid_count=cid_count,
-        selected_search=selected_search,
     )
 
 
@@ -1998,7 +2564,11 @@ def setup():
             "timestamp": datetime.fromtimestamp(latest_path.stat().st_mtime),
             "size": latest_path.stat().st_size,
         }
-        cache_valid, _ = is_cid_cache_valid(latest_path)
+        # Imported databases use source_hash="imported" — treat as valid
+        if cache and cache.get("source_hash") == "imported":
+            cache_valid = True
+        else:
+            cache_valid, _ = is_cid_cache_valid(latest_path)
 
     results_list = []
     if cache and "results" in cache:
@@ -2013,15 +2583,6 @@ def setup():
             if cid_val is None or (isinstance(cid_val, float) and cid_val != cid_val):  # None or NaN
                 no_match_rows.append(row)
 
-    # Helper to get repair status for a CAS number (used in template)
-    def get_repair_info(cas):
-        if not cache or "results" not in cache or not cas:
-            return {"attempted": False, "success": False}
-        result = cache["results"].get(cas, {})
-        attempted = result.get("repair_attempted", False)
-        success = result.get("status") == "repaired"
-        return {"attempted": attempted, "success": success}
-
     return render("setup",
         title="Setup",
         active_page="setup",
@@ -2035,7 +2596,6 @@ def setup():
         results=results_list,
         no_match_rows=no_match_rows,
         no_match_count=len(no_match_rows),
-        get_repair_info=get_repair_info,
     )
 
 
@@ -2069,6 +2629,9 @@ def results_page():
                     except (TypeError, ValueError):
                         pass
 
+            cache_key = upload_cids_to_pubchem_cache([str(c) for c in all_cids])
+            pubchem_url = f"https://pubchem.ncbi.nlm.nih.gov/#query={cache_key}" if cache_key else ""
+
             current_filter = {
                 "id": "all",
                 "search_name": "All Chemicals",
@@ -2076,7 +2639,7 @@ def results_page():
                 "matching_cids": all_cids,
                 "match_count": len(all_cids),
                 "created": "",
-                "pubchem_url": ""
+                "pubchem_url": pubchem_url
             }
         else:
             # Existing filter logic
@@ -2087,7 +2650,6 @@ def results_page():
 
         if current_filter:
             matching_cid_set = set(current_filter.get("matching_cids", []))
-            cid_cache_for_repair = load_cid_cache()
             for row in rug_table.get("rows", []):
                 cid_val = row.get("CID")
                 if cid_val is None:
@@ -2101,18 +2663,21 @@ def results_page():
                     row["_cid_int"] = cid_int
                     row["_ci"] = compound_info.get(str(cid_int), {})
 
-                    # Add repair status
-                    cas = row.get("Casnr", "")
-                    if cid_cache_for_repair and cas and cas in cid_cache_for_repair.get("results", {}):
-                        cache_entry = cid_cache_for_repair["results"][cas]
-                        row["_repair_status"] = "repaired" if cache_entry.get("status") == "repaired" else "original"
-                    else:
+                    # Repair status is already on the row if it was repaired
+                    if not row.get("_repair_status"):
                         row["_repair_status"] = "original"
 
                     filtered_rows.append(row)
 
     # Determine visible columns from defaults (JS will override via localStorage)
     visible_columns = list(DEFAULT_RESULTS_COLUMNS)
+
+    # Collect unique locations for the filter dropdown
+    unique_locations = sorted(set(
+        row.get("Location", "").strip()
+        for row in filtered_rows
+        if row.get("Location", "").strip()
+    ))
 
     return render("results",
         title="Results",
@@ -2125,6 +2690,7 @@ def results_page():
         default_columns=DEFAULT_RESULTS_COLUMNS,
         visible_columns=visible_columns,
         ghs_names=GHS_NAMES,
+        unique_locations=unique_locations,
     )
 
 
@@ -2277,6 +2843,18 @@ def open_pubchem():
     return jsonify({"pubchem_url": url})
 
 
+def _lookup_search_name(cache_key: str) -> str:
+    """Look up a human-readable name for a cache key from browser history or app searches."""
+    history = get_pubchem_history_details()
+    for entry in history:
+        if entry["cachekey"] == cache_key:
+            return entry["name"]
+    app_meta = load_app_search_metadata()
+    if cache_key in app_meta:
+        return app_meta[cache_key].get("query", "Unknown search")
+    return "Unknown search"
+
+
 @app.route("/api/combine-pubchem/<operation>", methods=["POST"])
 def combine_pubchem(operation):
     """Combine our CIDs with a selected PubChem search."""
@@ -2308,9 +2886,68 @@ def combine_pubchem(operation):
         return jsonify({"error": "Failed to upload CIDs to PubChem cache."})
 
     # Combine the two cache keys
-    combined_key = combine_pubchem_cache_keys(user_key, our_key, operation)
-    if not combined_key:
-        return jsonify({"error": "Failed to combine searches in PubChem."})
+    combine_result = combine_pubchem_cache_keys(user_key, our_key, operation)
+
+    combined_key = None
+    list_size = None
+    local_matching_cids = None  # Set if we computed results locally
+
+    if combine_result:
+        combined_key, list_size = combine_result
+    else:
+        # Combine API failed - try fallback: fetch both CID lists and compute locally
+        logger.info("Combine API failed, trying local fallback...")
+
+        user_cids = fetch_cids_from_listkey(user_key)
+        if user_cids is None:
+            # User search is stale/expired
+            search_name = _lookup_search_name(user_key)
+            return jsonify({
+                "error": "stale_search",
+                "cache_key": user_key,
+                "search_name": search_name,
+                "message": f"The search '{search_name}' is no longer available on PubChem (expired after ~12 hours).",
+            })
+
+        # Compute the operation locally
+        our_cid_set = set(int(c) for c in cids)
+        user_cid_set = set(user_cids)
+
+        if operation == "AND":
+            result_cids = our_cid_set & user_cid_set
+        elif operation == "OR":
+            result_cids = our_cid_set | user_cid_set
+        elif operation == "NOT":
+            result_cids = our_cid_set - user_cid_set
+        else:
+            result_cids = set()
+
+        list_size = len(result_cids)
+        local_matching_cids = list(result_cids)  # Save for later use
+        logger.info("Local fallback computed %d results for %s operation", list_size, operation)
+
+        if list_size > 0:
+            # Upload result CIDs to get a cache key
+            combined_key = upload_cids_to_pubchem_cache([str(c) for c in result_cids])
+            if not combined_key:
+                return jsonify({"error": "Failed to upload combined results to PubChem."})
+        else:
+            # 0 results - we'll handle this below
+            combined_key = None
+
+    # Handle the case where combine found 0 results (from API or local fallback)
+    if list_size == 0 or combined_key is None:
+        logger.info("Combine succeeded but found 0 matching compounds")
+        # Look up search name for the message
+        search_name = _lookup_search_name(user_key)
+
+        # Save empty filter result so user can see it was attempted
+        filter_id = save_filter_result(search_name, operation, [], "")
+        return jsonify({
+            "pubchem_url": "",
+            "filter_id": filter_id,
+            "match_count": 0,
+        })
 
     # Record this combined key as app-generated
     save_app_search(combined_key)
@@ -2318,46 +2955,39 @@ def combine_pubchem(operation):
     url = f"https://pubchem.ncbi.nlm.nih.gov/#query={combined_key}"
     result = {"pubchem_url": url}
 
-    # Fetch the actual matching CIDs from the combined listkey
-    logger.info("Fetching CIDs from combined listkey")
-    matching_cids = fetch_cids_from_listkey(combined_key)
+    # Get the matching CIDs - use local results if available, otherwise fetch
+    if local_matching_cids is not None:
+        matching_cids = local_matching_cids
+        logger.info("Using locally computed %d CIDs", len(matching_cids))
+    else:
+        logger.info("Fetching CIDs from combined listkey")
+        matching_cids = fetch_cids_from_listkey(combined_key)
 
-    if matching_cids is None:
-        # Fetch failed - check if user search is stale
-        logger.warning("CID fetch failed, checking if user search is stale...")
+        if matching_cids is None:
+            # Fetch failed - check if user search is stale
+            logger.warning("CID fetch failed, checking if user search is stale...")
 
-        # Validate the user's original search
-        user_cids = fetch_cids_from_listkey(user_key)
-        if user_cids is None:
-            # User search is stale
-            search_name = "Unknown search"
-            history = get_pubchem_history_details()
-            for entry in history:
-                if entry["cachekey"] == user_key:
-                    search_name = entry["name"]
-                    break
+            # Validate the user's original search
+            user_cids = fetch_cids_from_listkey(user_key)
+            if user_cids is None:
+                # User search is stale
+                search_name = _lookup_search_name(user_key)
+                return jsonify({
+                    "error": "stale_search",
+                    "cache_key": user_key,
+                    "search_name": search_name,
+                    "message": f"The search '{search_name}' is no longer available on PubChem (expired after ~12 hours)."
+                })
 
+            # Combined operation failed for other reason
             return jsonify({
-                "error": "stale_search",
-                "cache_key": user_key,
-                "search_name": search_name,
-                "message": f"The search '{search_name}' is no longer available on PubChem (expired after ~12 hours)."
+                "error": "combine_failed",
+                "message": "Failed to combine searches in PubChem."
             })
 
-        # Combined operation failed for other reason
-        return jsonify({
-            "error": "combine_failed",
-            "message": "Failed to combine searches in PubChem."
-        })
-
     if matching_cids:
-        # Look up search name from history
-        search_name = "Unknown search"
-        history = get_pubchem_history_details()
-        for entry in history:
-            if entry["cachekey"] == user_key:
-                search_name = entry["name"]
-                break
+        # Look up search name from history or app searches
+        search_name = _lookup_search_name(user_key)
         filter_id = save_filter_result(search_name, operation, matching_cids, url)
         result["filter_id"] = filter_id
 
@@ -2423,9 +3053,31 @@ def pubchem_history():
             "history lookup. Only Firefox and Chrome are supported."
         )
 
-    # Filter out app-generated and stale searches by default
+    # Load app search metadata and stale searches
+    app_search_metadata = load_app_search_metadata()
     app_searches = load_app_searches()
     stale_searches = load_stale_searches()
+
+    # Get existing cache keys from browser history
+    browser_history_keys = {entry["cachekey"] for entry in history}
+
+    # Add app-initiated direct searches to history that aren't already present
+    # These are distinct from combined searches - they ARE meant to be combined
+    for cache_key, meta in app_search_metadata.items():
+        if cache_key not in browser_history_keys and cache_key not in stale_searches:
+            history.append({
+                "cachekey": cache_key,
+                "name": meta.get("query", "App search"),
+                "timestamp": meta.get("timestamp", ""),
+                "browser": "App",
+                "url": f"https://pubchem.ncbi.nlm.nih.gov/#query={cache_key}",
+                "_list_size": meta.get("count"),
+            })
+
+    # Sort by timestamp (most recent first)
+    history.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+
+    # Filter out app-generated and stale searches by default
     excluded_searches = app_searches | stale_searches
 
     filtered_history = [
@@ -2440,6 +3092,190 @@ def pubchem_history():
         "default_browser": default_browser,
         "browser_warning": warning,
         "app_search_count": len(history) - len(filtered_history),
+    })
+
+
+def _pubchem_structure_search(search_type: str, smiles: str, threshold: int = 90) -> dict | None:
+    """Execute a PubChem structure search via structure_search.cgi.
+
+    Uses PubChem's internal structure_search.cgi endpoint which returns a
+    cachekey directly, avoiding the unreliable PUG REST ListKey polling.
+
+    Args:
+        search_type: One of 'substructure', 'superstructure', 'similarity'
+        smiles: SMILES string to search
+        threshold: Similarity threshold (only used for similarity search)
+
+    Returns:
+        Dict with 'cache_key' and 'count', or None if failed
+    """
+    import json as _json
+    from urllib.parse import quote
+
+    parameters = [
+        {"name": "smiles", "string": smiles},
+        {"name": "UseCache", "bool": True},
+        {"name": "SearchTimeMsec", "num": 5000},
+        {"name": "SearchMaxRecords", "num": 10000},
+    ]
+    if search_type == "similarity":
+        parameters.append({"name": "Threshold", "num": threshold})
+
+    queryblob = _json.dumps({
+        "query": {
+            "type": search_type,
+            "parameter": parameters,
+        }
+    })
+
+    url = (
+        "https://pubchem.ncbi.nlm.nih.gov/unified_search/structure_search.cgi"
+        f"?format=json&queryblob={quote(queryblob)}"
+    )
+
+    logger.info("Submitting %s search via structure_search.cgi", search_type)
+
+    try:
+        resp = _requests.get(url, timeout=60)
+    except _requests.RequestException as e:
+        logger.error("PubChem %s search failed: %s", search_type, e)
+        return None
+
+    if resp.status_code != 200:
+        logger.error("PubChem %s search HTTP %d: %s", search_type, resp.status_code, resp.text[:300])
+        return None
+
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.error("Invalid JSON from PubChem %s search", search_type)
+        return None
+
+    response = data.get("response", {})
+    cachekey = response.get("cachekey")
+    hitcount = response.get("hitcount", 0)
+
+    if not cachekey:
+        logger.error("No cachekey in response: %s", data)
+        return None
+
+    logger.info("Got cachekey: %s... (%d hits)", cachekey[:20], hitcount)
+    return {"cache_key": cachekey, "count": hitcount}
+
+
+@app.route("/api/pubchem-search", methods=["POST"])
+def pubchem_search():
+    """Execute a PubChem search and return a cache key."""
+    from urllib.parse import quote
+
+    data = request.get_json()
+    query = data.get("query", "").strip() if data else ""
+    mode = data.get("mode", "name") if data else "name"
+
+    if not query:
+        return jsonify({"error": "No query provided"})
+
+    cids = None
+    search_label = query  # Label for the search in history
+
+    if mode == "name":
+        # Synchronous name/keyword search
+        url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{quote(query)}/cids/JSON"
+        try:
+            resp = _requests.get(url, timeout=30)
+        except _requests.RequestException as e:
+            logger.error("PubChem name search failed: %s", e)
+            return jsonify({"error": f"Request failed: {e}"})
+
+        if resp.status_code == 404:
+            return jsonify({"error": "No results found", "count": 0})
+        if resp.status_code != 200:
+            return jsonify({"error": f"PubChem error: {resp.status_code}"})
+
+        try:
+            cids = resp.json().get("IdentifierList", {}).get("CID", [])
+        except (ValueError, KeyError):
+            return jsonify({"error": "Invalid response from PubChem"})
+
+    elif mode == "smiles":
+        # Synchronous exact SMILES search
+        url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/{quote(query)}/cids/JSON"
+        try:
+            resp = _requests.get(url, timeout=30)
+        except _requests.RequestException as e:
+            logger.error("PubChem SMILES search failed: %s", e)
+            return jsonify({"error": f"Request failed: {e}"})
+
+        if resp.status_code == 404:
+            return jsonify({"error": "No compound found for this SMILES", "count": 0})
+        if resp.status_code != 200:
+            # Check for invalid SMILES error
+            try:
+                err_data = resp.json()
+                if "Fault" in err_data:
+                    fault_msg = err_data["Fault"].get("Message", "Invalid SMILES")
+                    return jsonify({"error": fault_msg})
+            except ValueError:
+                pass
+            return jsonify({"error": f"PubChem error: {resp.status_code}"})
+
+        try:
+            cids = resp.json().get("IdentifierList", {}).get("CID", [])
+        except (ValueError, KeyError):
+            return jsonify({"error": "Invalid response from PubChem"})
+        search_label = f"SMILES: {query[:30]}{'...' if len(query) > 30 else ''}"
+
+    elif mode in ("substructure", "superstructure", "similarity"):
+        # Structure searches - use ListKey-based approach (doesn't download all CIDs)
+        result = _pubchem_structure_search(mode, query)
+        if result is None:
+            return jsonify({"error": f"{mode.title()} search failed. Check that your SMILES is valid."})
+
+        cache_key = result.get("cache_key")
+        cid_count = result.get("count", 0)
+
+        if not cache_key:
+            if cid_count == 0:
+                return jsonify({"error": "No results found", "count": 0})
+            return jsonify({"error": "Failed to create search cache"})
+
+        mode_labels = {
+            "substructure": "Substructure",
+            "superstructure": "Superstructure",
+            "similarity": "Similarity"
+        }
+        search_label = f"{mode_labels[mode]}: {query[:25]}{'...' if len(query) > 25 else ''}"
+
+        # Save and return directly (we already have cache_key)
+        save_app_search_with_metadata(cache_key, search_label, cid_count)
+        return jsonify({
+            "success": True,
+            "cache_key": cache_key,
+            "query": search_label,
+            "count": cid_count,
+            "url": f"https://pubchem.ncbi.nlm.nih.gov/#query={cache_key}"
+        })
+
+    else:
+        return jsonify({"error": f"Unknown search mode: {mode}"})
+
+    if not cids:
+        return jsonify({"error": "No results found", "count": 0})
+
+    # Upload CIDs to get cache key (for name/smiles searches)
+    cache_key = upload_cids_to_pubchem_cache([str(c) for c in cids])
+    if not cache_key:
+        return jsonify({"error": "Failed to create search cache"})
+
+    # Save to app searches file with metadata
+    save_app_search_with_metadata(cache_key, search_label, len(cids))
+
+    return jsonify({
+        "success": True,
+        "cache_key": cache_key,
+        "query": search_label,
+        "count": len(cids),
+        "url": f"https://pubchem.ncbi.nlm.nih.gov/#query={cache_key}"
     })
 
 
@@ -2505,12 +3341,9 @@ def download_mapping():
 
 @app.route("/api/repair-unmatched/start", methods=["POST"])
 def start_repair():
-    """Start repair task for unmatched entries."""
-    data = request.get_json() or {}
-    review_mode = data.get("review_mode", False)
-
-    if start_repair_task(review_mode=review_mode):
-        return jsonify({"status": "started", "review_mode": review_mode})
+    """Start repair task for unmatched entries (always review mode)."""
+    if start_repair_task():
+        return jsonify({"status": "started"})
     else:
         return jsonify({"error": "Repair task already running"}), 409
 
@@ -2532,8 +3365,7 @@ def repair_status():
         "progress": progress_text,
         "processed": s["processed"],
         "total": s["total"],
-        "current_name": s.get("current_name", ""),
-        "review_mode": s.get("review_mode", False)
+        "current_name": s.get("current_name", "")
     })
 
 
@@ -2552,9 +3384,9 @@ def get_pending_repairs():
 
 @app.route("/api/repair-unmatched/apply", methods=["POST"])
 def apply_repairs():
-    """Apply approved repairs to CID cache."""
+    """Apply approved repairs directly to rug_table rows by index."""
     data = request.get_json()
-    approved_cas = set(data.get("approved", []))  # List of CAS numbers to accept
+    approved_indices = set(int(i) for i in data.get("approved", []))
 
     pending_file = DATA_DIR / "pending_repairs.json"
     if not pending_file.exists():
@@ -2563,23 +3395,52 @@ def apply_repairs():
     with open(pending_file) as f:
         pending_data = json.load(f)
 
-    # Load current cache
+    # Load current data
+    from extract_chemicals import load_rug_table, RUG_TABLE_FILE
+    rug_table = load_rug_table()
     cid_cache = load_cid_cache()
-    if not cid_cache:
-        return jsonify({"error": "CID cache not found"}), 404
+    if not rug_table or not cid_cache:
+        return jsonify({"error": "Data not found"}), 404
 
-    # Apply approved repairs
+    rows = rug_table.get("rows", [])
+
+    # Apply approved repairs by row index
     applied_count = 0
     for entry in pending_data.get("repaired_entries", []):
-        cas = entry["cas"]
-        if cas in approved_cas and cas in cid_cache.get("results", {}):
-            cache_entry = cid_cache["results"][cas]
-            cache_entry["repair_attempted"] = True
-            cache_entry["status"] = "repaired"
-            cache_entry["cid"] = entry["cid"]
-            cache_entry["repair_source"] = entry["repair_source"]
-            cache_entry["repair_timestamp"] = datetime.now().isoformat()
-            applied_count += 1
+        row_index = entry.get("row_index")
+        if row_index is None or row_index not in approved_indices:
+            continue
+        if row_index < 0 or row_index >= len(rows):
+            continue
+
+        row = rows[row_index]
+        cid = entry["cid"]
+        real_cas = entry.get("real_cas")
+
+        # Set CID and repair metadata on the row
+        row["CID"] = cid
+        row["_repair_status"] = "repaired"
+        row["_repair_source"] = entry.get("repair_source", "")
+
+        # Update CAS: store original, set new real CAS if available
+        if real_cas:
+            row["_original_cas"] = row.get("Casnr", "")
+            row["Casnr"] = real_cas
+
+        # Add cache entry keyed by the (possibly new) CAS
+        cache_cas = row["Casnr"]
+        cid_cache.setdefault("results", {})[cache_cas] = {
+            "cid": cid,
+            "status": "repaired",
+            "repair_attempted": True,
+            "repair_source": entry.get("repair_source", ""),
+            "repair_timestamp": datetime.now().isoformat()
+        }
+
+        applied_count += 1
+
+    # Save rug_table directly (preserves row metadata)
+    RUG_TABLE_FILE.write_text(json.dumps(rug_table, indent=2, default=str))
 
     # Save updated cache
     save_cid_cache(
@@ -2587,11 +3448,6 @@ def apply_repairs():
         cid_cache["source_hash"],
         cid_cache["results"]
     )
-
-    # Rebuild RUG table
-    from extract_chemicals import save_rug_table, load_rug_table, parse_html_table
-    original_df = parse_html_table(Path(cid_cache["source_html"]))
-    save_rug_table(original_df, cid_cache["results"])
 
     # Delete pending file
     pending_file.unlink()
@@ -2604,6 +3460,159 @@ def apply_repairs():
         "applied": applied_count,
         "total_pending": len(pending_data.get("repaired_entries", []))
     })
+
+
+@app.route("/api/export-database", methods=["POST"])
+def export_database():
+    """Export all data as a single JSON bundle."""
+    rug_table = load_rug_table()
+    cid_cache = load_cid_cache()
+    compound_info = load_compound_info()
+
+    bundle = {
+        "version": 1,
+        "exported": datetime.now().isoformat(),
+        "cid_cache": cid_cache,
+        "rug_table": rug_table,
+        "compound_info": compound_info,
+    }
+
+    return Response(
+        json.dumps(bundle, default=str),
+        mimetype="application/json",
+        headers={"Content-Disposition": "attachment; filename=chem_database_export.json"},
+    )
+
+
+def _do_import_database(bundle):
+    """Shared import logic. Returns (success, error_msg)."""
+    if not isinstance(bundle, dict):
+        return False, "Invalid JSON: expected object"
+    if bundle.get("version") != 1:
+        return False, "Unsupported bundle version"
+    if "cid_cache" not in bundle or "rug_table" not in bundle:
+        return False, "Bundle must contain cid_cache and rug_table"
+
+    cid_cache = bundle["cid_cache"]
+    rug_table = bundle["rug_table"]
+    compound_info = bundle.get("compound_info")
+
+    # Mark as imported
+    cid_cache["source_html"] = "imported"
+    cid_cache["source_hash"] = "imported"
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Write cid_cache
+    CID_CACHE_FILE.write_text(json.dumps(cid_cache, indent=2, default=str))
+
+    # Write rug_table
+    RUG_TABLE_FILE.write_text(json.dumps(rug_table, indent=2, default=str))
+
+    # Write compound_info if present
+    if compound_info:
+        COMPOUND_INFO_FILE.write_text(json.dumps(compound_info, indent=2, default=str))
+
+    # Create dummy snapshot + latest.txt pointer so setup detects a valid state
+    SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    dummy_path = SNAPSHOTS_DIR / "imported_database.html"
+    if not dummy_path.exists():
+        dummy_path.write_text("<html><body>Imported database</body></html>")
+    update_latest_pointer(dummy_path)
+
+    # Trigger compound info fetch if not in bundle
+    if not compound_info or not compound_info.get("compounds"):
+        start_compound_info_fetch()
+
+    return True, None
+
+
+@app.route("/api/import-database", methods=["POST"])
+def import_database():
+    """Import a database bundle from uploaded JSON."""
+    try:
+        bundle = request.get_json(force=True)
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Invalid JSON: {e}"})
+
+    success, error = _do_import_database(bundle)
+    if success:
+        return jsonify({"success": True})
+    return jsonify({"success": False, "error": error})
+
+
+@app.route("/api/import-database-url", methods=["POST"])
+def import_database_url():
+    """Import a database bundle from a URL (e.g. Google Drive)."""
+    data = request.get_json(force=True)
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"success": False, "error": "No URL provided"})
+
+    # Convert Google Drive share URLs to direct download
+    import re as _re
+    gd_match = _re.search(r'drive\.google\.com/file/d/([^/]+)', url)
+    if gd_match:
+        file_id = gd_match.group(1)
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    elif 'drive.google.com' in url and 'id=' in url:
+        gd_match2 = _re.search(r'[?&]id=([^&]+)', url)
+        if gd_match2:
+            file_id = gd_match2.group(1)
+            url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    original_url = data.get("url", "").strip()
+
+    try:
+        resp = _requests.get(url, timeout=30, allow_redirects=True)
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Download failed: {e}"})
+
+    content_type = resp.headers.get("Content-Type", "")
+    body = resp.text.strip()
+
+    # Detect HTML login page instead of JSON
+    if "text/html" in content_type or body.startswith("<"):
+        return jsonify({
+            "success": False,
+            "auth_required": True,
+            "url": original_url,
+            "error": "Authentication required — download the file in your browser and use the file upload option.",
+        })
+
+    try:
+        bundle = resp.json()
+    except Exception:
+        return jsonify({"success": False, "error": "Response is not valid JSON"})
+
+    success, error = _do_import_database(bundle)
+    if success:
+        return jsonify({"success": True})
+    return jsonify({"success": False, "error": error})
+
+
+@app.route("/api/filter-results/<filter_id>/save", methods=["POST"])
+def save_filter(filter_id):
+    """Mark a filter result as saved."""
+    if toggle_saved_filter(filter_id, True):
+        return jsonify({"success": True})
+    return jsonify({"success": False, "error": "Filter not found"}), 404
+
+
+@app.route("/api/filter-results/<filter_id>/unsave", methods=["POST"])
+def unsave_filter(filter_id):
+    """Remove saved flag from a filter result."""
+    if toggle_saved_filter(filter_id, False):
+        return jsonify({"success": True})
+    return jsonify({"success": False, "error": "Filter not found"}), 404
+
+
+@app.route("/api/filter-results/<filter_id>", methods=["DELETE"])
+def remove_filter(filter_id):
+    """Delete a filter result entirely."""
+    if delete_filter_result(filter_id):
+        return jsonify({"success": True})
+    return jsonify({"success": False, "error": "Filter not found"}), 404
 
 
 @app.route("/api/quit", methods=["POST"])
