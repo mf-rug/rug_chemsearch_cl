@@ -23,7 +23,7 @@ if sys.stdout is None:
     print(f"Session started: {datetime.now().isoformat()}")
     print(f"{'='*50}")
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 import json
 from datetime import datetime
@@ -4057,9 +4057,22 @@ def git_pull():
     """Run git pull to update a source install."""
     import subprocess
     try:
+        repo_dir = os.path.dirname(__file__) or "."
+        # Detect default branch
+        result = subprocess.run(
+            ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+            capture_output=True, text=True, timeout=10, cwd=repo_dir,
+        )
+        default_branch = result.stdout.strip().split("/")[-1] if result.returncode == 0 else "main"
+        # Checkout default branch (handles detached HEAD)
+        subprocess.run(
+            ["git", "checkout", default_branch],
+            capture_output=True, text=True, timeout=10, cwd=repo_dir,
+        )
+        # Pull
         result = subprocess.run(
             ["git", "pull"], capture_output=True, text=True, timeout=30,
-            cwd=os.path.dirname(__file__) or ".",
+            cwd=repo_dir,
         )
         if result.returncode == 0:
             return jsonify({"success": True, "output": result.stdout})
