@@ -23,7 +23,7 @@ if sys.stdout is None:
     print(f"Session started: {datetime.now().isoformat()}")
     print(f"{'='*50}")
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 import json
 from datetime import datetime
@@ -741,7 +741,7 @@ BASE_TEMPLATE = """
                 if (data.error) {
                     el.innerHTML = 'Could not check for updates: ' + data.error;
                 } else if (!data.update_available) {
-                    el.innerHTML = data.message || 'You\u2019re on the latest version (v' + data.current + ').';
+                    el.innerHTML = data.message || '\u2714 You\u2019re on the latest version (v' + data.current + ').';
                 } else {
                     let notes = data.release_notes ? '<p style="margin:8px 0;white-space:pre-wrap;max-height:120px;overflow:auto;font-size:0.8rem;background:var(--bg-card);padding:8px;border-radius:4px;">' + data.release_notes.replace(/</g,'&lt;') + '</p>' : '';
                     let action = '';
