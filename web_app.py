@@ -23,6 +23,8 @@ if sys.stdout is None:
     print(f"Session started: {datetime.now().isoformat()}")
     print(f"{'='*50}")
 
+APP_VERSION = "1.0.0"
+
 import json
 from datetime import datetime
 from pathlib import Path
@@ -81,6 +83,10 @@ from extract_chemicals import (
 logger = logging.getLogger("chemical_extractor")
 
 app = Flask(__name__)
+
+@app.context_processor
+def inject_version():
+    return dict(version=APP_VERSION)
 
 # ============================================================================
 # Background compound info fetch
@@ -725,6 +731,28 @@ BASE_TEMPLATE = """
             }
         }
     </script>
+    <script>
+    function checkForUpdates() {
+        const el = document.getElementById('update-result');
+        el.innerHTML = 'Checking...';
+        fetch('/api/check-update')
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    el.innerHTML = 'Could not check for updates: ' + data.error;
+                } else if (!data.update_available) {
+                    el.innerHTML = data.message || 'You\u2019re on the latest version (v' + data.current + ').';
+                } else {
+                    let notes = data.release_notes ? '<p style="margin:8px 0;white-space:pre-wrap;max-height:120px;overflow:auto;font-size:0.8rem;background:var(--bg-card);padding:8px;border-radius:4px;">' + data.release_notes.replace(/</g,'&lt;') + '</p>' : '';
+                    el.innerHTML = '<strong>v' + data.latest + ' is available!</strong> (you have v' + data.current + ')' +
+                        notes +
+                        '<a href="' + data.download_url + '" target="_blank" class="btn" style="font-size:0.85rem;padding:6px 14px;margin-top:6px;display:inline-block;">Download</a>' +
+                        '<p style="margin-top:8px;font-size:0.8rem;color:var(--text-dim);">Download the zip, close this app, replace your ChemicalExtractor folder contents with the new files, and relaunch.</p>';
+                }
+            })
+            .catch(() => { el.innerHTML = 'Could not check for updates (no internet?).'; });
+    }
+    </script>
     {% block scripts %}{% endblock %}
 
 <!-- About modal -->
@@ -732,6 +760,7 @@ BASE_TEMPLATE = """
     <div style="background:var(--bg-light); border-radius:8px; max-width:480px; width:90%; padding:24px; position:relative;">
         <button onclick="document.getElementById('about-modal').style.display='none'" style="position:absolute; top:12px; right:16px; background:none; border:none; font-size:1.4rem; cursor:pointer; color:var(--text-dim);">&times;</button>
         <h2 style="margin-top:0;">About RUG Chemical Search</h2>
+        <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px;">Version <strong>v{{ version }}</strong></p>
         <p style="color:var(--text-dim); line-height:1.6; font-size:0.9rem;">
             This app lets you cross-reference your lab's chemical inventory with
             <a href="https://pubchem.ncbi.nlm.nih.gov/" target="_blank" style="color:var(--link);">PubChem</a>.
@@ -742,6 +771,11 @@ BASE_TEMPLATE = """
             You can also search PubChem directly in your browser &mdash; the app detects those searches
             automatically and makes them available for combining with your inventory.
         </p>
+        <hr style="border:none; border-top:1px solid var(--accent); margin:16px 0;">
+        <div id="update-section" style="margin-bottom:12px;">
+            <button onclick="checkForUpdates()" class="btn" style="font-size:0.85rem; padding:6px 14px;">Check for updates</button>
+            <div id="update-result" style="margin-top:10px; font-size:0.85rem; color:var(--text-dim);"></div>
+        </div>
         <hr style="border:none; border-top:1px solid var(--accent); margin:16px 0;">
         <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:0;">
             Bug reports &amp; feature requests:
@@ -766,9 +800,9 @@ SEARCH_TEMPLATE = """
 {% else %}
 
 <div class="search-hero">
-    <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 4px;">
+    <div style="display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 4px;">
         <h2 style="margin: 0;">Search Your {{ cid_count }} Chemicals</h2>
-        <a href="{{ url_for('results_page', filter_id='all') }}" class="btn btn-success" style="padding: 5px 14px; font-size: 0.85rem;">View All {{ cid_count }}</a>
+        <a href="{{ url_for('results_page', filter_id='all') }}" style="color: var(--text-dim); font-size: 0.8rem; text-decoration: underline; opacity: 0.8;">View All</a>
     </div>
     <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px;">
         <div class="search-input-wrapper">
@@ -1212,9 +1246,9 @@ async function directPubchemSearch(btn, historyOnly) {
     }
 }
 
-// --- Smart auto-refresh: poll file fingerprint every 5s, full fetch only on change ---
+// --- Smart auto-refresh: poll file fingerprint every 50s, full fetch only on change ---
 let lastFingerprint = null;
-const POLL_INTERVAL_MS = 5000;
+const POLL_INTERVAL_MS = 50000;
 
 async function pollForChanges() {
     try {
@@ -1332,12 +1366,12 @@ GHS_NAMES = {
 
 # Default columns for the results table (order matters)
 DEFAULT_RESULTS_COLUMNS = [
-    "Structure", "Name", "CAS", "Formula", "MW", "Hazards", "Location", "CID",
+    "Structure", "Name", "CAS", "Formula", "MW", "Hazards", "Location",
 ]
 
 # All available columns (default + hidden RUG originals)
 ALL_RESULTS_COLUMNS = DEFAULT_RESULTS_COLUMNS + [
-    "EntryName", "Pot", "Owner", "OwnerRegNumber", "IUPAC", "SMILES",
+    "GROSname", "Pot", "Owner", "OwnerRegNumber", "IUPAC", "SMILES", "CID",
 ]
 
 RESULTS_TEMPLATE = """
@@ -1430,16 +1464,55 @@ RESULTS_TEMPLATE = """
     #mw-slider .noUi-pips { top: 100%; padding-top: 2px; }
 
     @media print {
+        @page {
+            size: landscape;
+            margin: 0.5cm;
+        }
+
+        body {
+            font-size: 10pt;
+        }
+
+        /* Hide page header/footer elements */
         nav, .dt-buttons, #advanced-filters, .dataTables_length, .dataTables_filter,
         .dataTables_info, .dataTables_paginate, .btn, .btn-secondary, select,
-        label.text-dim, #compound-info-badge, .alert { display: none !important; }
+        label.text-dim, #compound-info-badge, .alert, .advanced-filters, .filter-info { display: none !important; }
+
         .print-header { display: block !important; }
-        body, .card, .table-responsive, table { background: white !important; color: black !important; }
+        body, .card { background: white !important; color: black !important; }
         .structure-large { display: none !important; }
         .structure-cell:hover .structure-large { display: none !important; }
         .structure-cell:hover .structure-thumb { visibility: visible !important; }
         tr { page-break-inside: avoid; }
         * { color: black !important; border-color: #ccc !important; }
+
+        /* Default: normal size for tables with few columns */
+        .table-responsive {
+            overflow: visible !important;
+        }
+
+        #results-data-table th,
+        #results-data-table td {
+            padding: 4px 6px !important;
+            white-space: nowrap;
+        }
+
+        /* Scale down only when many columns are visible */
+        .table-responsive.print-scale-many {
+            width: fit-content !important;
+            max-width: none !important;
+            transform-origin: top left;
+            transform: scale(0.6);
+        }
+
+        .print-scale-many #results-data-table {
+            font-size: 8pt;
+        }
+
+        .print-scale-many #results-data-table th,
+        .print-scale-many #results-data-table td {
+            padding: 2px 3px !important;
+        }
     }
 </style>
 
@@ -1545,7 +1618,62 @@ RESULTS_TEMPLATE = """
     </div>
 
     {% if filtered_rows %}
-    <div class="table-responsive">
+    {% macro render_cell(row, col, grouped=false) %}
+        {% if col == 'Structure' %}
+        <div class="structure-cell">
+            {% if row._cid_int %}
+            <img class="structure-thumb" src="https://pubchem.ncbi.nlm.nih.gov/image/imgsrv.fcgi?cid={{ row._cid_int }}&amp;t=s" alt="structure" loading="lazy">
+            <img class="structure-large" src="https://pubchem.ncbi.nlm.nih.gov/image/imgsrv.fcgi?cid={{ row._cid_int }}&amp;t=l" alt="structure" loading="lazy">
+            {% else %}-{% endif %}
+        </div>
+        {% elif col == 'CID' %}
+            {% if row._cid_int %}
+            <a href="https://pubchem.ncbi.nlm.nih.gov/compound/{{ row._cid_int }}" target="_blank" style="color: var(--success);" class="mono">{{ row._cid_int }}</a>
+            {% else %}-{% endif %}
+        {% elif col == 'Name' %}
+            {{ row._ci.get('title', '') or '-' }}{% if row._repair_status == 'repaired' %} <span class="badge badge-warning" title="Found via text search (repaired)" style="margin-left: 4px; font-size: 0.7rem;">&#128295;</span>{% endif %}{% if grouped and row._group_count > 1 %} <span class="badge" style="background: var(--accent); color: var(--bg); font-size: 0.7rem; padding: 1px 5px; border-radius: 8px; margin-left: 4px;">&times;{{ row._group_count }}</span>{% endif %}
+        {% elif col == 'GROSname' %}
+            {% if grouped and col in row._group_varying %}
+                <span class="vary-pop text-dim" style="font-size:0.75rem;cursor:pointer;text-decoration:underline dotted;" title="Click to view">{{ row._group_varying[col]|length }} values</span><span class="vary-pop-content" style="display:none;">{{ row._group_varying[col]|join(', ') }}</span>
+            {% else %}{{ row.get('Name', '') or '-' }}{% endif %}
+        {% elif col == 'CAS' %}
+            {% if row._cid_int %}
+                {% if row.get('_original_cas') %}
+                    <s>{{ row._original_cas }}</s> <a href="https://pubchem.ncbi.nlm.nih.gov/compound/{{ row._cid_int }}" target="_blank" style="color: var(--success);">{{ row.get('Casnr', '') }}</a>
+                {% else %}
+                    <a href="https://pubchem.ncbi.nlm.nih.gov/compound/{{ row._cid_int }}" target="_blank" style="color: var(--success);">{{ row.get('Casnr', '') }}</a>
+                {% endif %}
+            {% else %}
+                {% if row.get('_original_cas') %}<s>{{ row._original_cas }}</s> {{ row.get('Casnr', '') }}{% else %}{{ row.get('Casnr', '') or '-' }}{% endif %}
+            {% endif %}
+        {% elif col == 'Formula' %}
+            {% set formula = row._ci.get('formula', '') or row.get('Formula', '') or '-' %}
+            {% if formula != '-' %}
+                <span data-plaintext="{{ formula }}">{{ formula|replace('0', '<sub>0</sub>')|replace('1', '<sub>1</sub>')|replace('2', '<sub>2</sub>')|replace('3', '<sub>3</sub>')|replace('4', '<sub>4</sub>')|replace('5', '<sub>5</sub>')|replace('6', '<sub>6</sub>')|replace('7', '<sub>7</sub>')|replace('8', '<sub>8</sub>')|replace('9', '<sub>9</sub>')|safe }}
+                </span>
+            {% else %}
+                -
+            {% endif %}
+        {% elif col == 'MW' %}{{ row._ci.get('mw', '') or '-' }}
+        {% elif col == 'SMILES' %}<span class="smiles-cell" title="{{ row._ci.get('smiles', '') }}">{{ row._ci.get('smiles', '') or '-' }}</span>
+        {% elif col == 'IUPAC' %}{{ row._ci.get('iupac', '') or '-' }}
+        {% elif col == 'Hazards' %}
+            {% for code in row._ci.get('ghs_pictograms', []) %}
+            <img class="ghs-icon" src="https://pubchem.ncbi.nlm.nih.gov/images/ghs/{{ code }}.svg" title="{{ ghs_names.get(code, code) }}" alt="{{ code }}" loading="lazy">
+            {% endfor %}
+            {% if not row._ci.get('ghs_pictograms') %}-{% endif %}
+        {% elif col == 'Location' %}
+            {% if grouped and col in row._group_varying %}
+                <span class="vary-pop text-dim" style="font-size:0.75rem;cursor:pointer;text-decoration:underline dotted;" title="Click to view">{{ row._group_varying[col]|length }} values</span><span class="vary-pop-content" style="display:none;">{{ row._group_varying[col]|join(', ') }}</span>
+            {% else %}{{ row.get('Location', '') or '-' }}{% endif %}
+        {% else %}
+            {% if grouped and col in row.get('_group_varying', {}) %}
+                <span class="vary-pop text-dim" style="font-size:0.75rem;cursor:pointer;text-decoration:underline dotted;" title="Click to view">{{ row._group_varying[col]|length }} values</span><span class="vary-pop-content" style="display:none;">{{ row._group_varying[col]|join(', ') }}</span>
+            {% else %}{{ row.get(col, '') or '-' }}{% endif %}
+        {% endif %}
+    {% endmacro %}
+
+    <div class="table-responsive" id="individual-table-wrapper">
         <table id="results-data-table" class="display" style="width:100%">
             <thead>
                 <tr>
@@ -1558,34 +1686,28 @@ RESULTS_TEMPLATE = """
                 {% for row in filtered_rows %}
                 <tr>
                     {% for col in all_columns %}
-                    <td data-column="{{ col }}">
-                        {% if col == 'Structure' %}
-                        <div class="structure-cell">
-                            {% if row._cid_int %}
-                            <img class="structure-thumb" src="https://pubchem.ncbi.nlm.nih.gov/image/imgsrv.fcgi?cid={{ row._cid_int }}&amp;t=s" alt="structure" loading="lazy">
-                            <img class="structure-large" src="https://pubchem.ncbi.nlm.nih.gov/image/imgsrv.fcgi?cid={{ row._cid_int }}&amp;t=l" alt="structure" loading="lazy">
-                            {% else %}-{% endif %}
-                        </div>
-                        {% elif col == 'CID' %}
-                            {% if row._cid_int %}
-                            <a href="https://pubchem.ncbi.nlm.nih.gov/compound/{{ row._cid_int }}" target="_blank" style="color: var(--success);" class="mono">{{ row._cid_int }}</a>
-                            {% else %}-{% endif %}
-                        {% elif col == 'Name' %}{{ row._ci.get('title', '') or '-' }}{% if row._repair_status == 'repaired' %} <span class="badge badge-warning" title="Found via text search (repaired)" style="margin-left: 4px; font-size: 0.7rem;">&#128295;</span>{% endif %}
-                        {% elif col == 'EntryName' %}{{ row.get('Name', '') or '-' }}
-                        {% elif col == 'CAS' %}{% if row.get('_original_cas') %}<s>{{ row._original_cas }}</s> {{ row.get('Casnr', '') }}{% else %}{{ row.get('Casnr', '') or '-' }}{% endif %}
-                        {% elif col == 'Formula' %}{{ row._ci.get('formula', '') or row.get('Formula', '') or '-' }}
-                        {% elif col == 'MW' %}{{ row._ci.get('mw', '') or '-' }}
-                        {% elif col == 'SMILES' %}<span class="smiles-cell" title="{{ row._ci.get('smiles', '') }}">{{ row._ci.get('smiles', '') or '-' }}</span>
-                        {% elif col == 'IUPAC' %}{{ row._ci.get('iupac', '') or '-' }}
-                        {% elif col == 'Hazards' %}
-                            {% for code in row._ci.get('ghs_pictograms', []) %}
-                            <img class="ghs-icon" src="https://pubchem.ncbi.nlm.nih.gov/images/ghs/{{ code }}.svg" title="{{ ghs_names.get(code, code) }}" alt="{{ code }}" loading="lazy">
-                            {% endfor %}
-                            {% if not row._ci.get('ghs_pictograms') %}-{% endif %}
-                        {% elif col == 'Location' %}{{ row.get('Location', '') or '-' }}
-                        {% else %}{{ row.get(col, '') or '-' }}
-                        {% endif %}
-                    </td>
+                    <td data-column="{{ col }}">{{ render_cell(row, col) }}</td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="table-responsive" id="grouped-table-wrapper">
+        <table id="results-grouped-table" class="display" style="width:100%">
+            <thead>
+                <tr>
+                    {% for col in all_columns %}
+                    <th>{{ col }}</th>
+                    {% endfor %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in grouped_rows %}
+                <tr>
+                    {% for col in all_columns %}
+                    <td data-column="{{ col }}">{{ render_cell(row, col, grouped=true) }}</td>
                     {% endfor %}
                 </tr>
                 {% endfor %}
@@ -1614,134 +1736,237 @@ $(document).ready(function() {
     } catch(e) {}
 
     // Build column definitions
-    const columnDefs = ALL_COLS.map((col, idx) => {
-        let def = {
-            targets: idx,
-            title: col,
-            visible: visibleCols.includes(col),
-            className: 'col-' + col
-        };
-
-        // Special column handling
-        if (col === 'Structure') {
-            def.orderable = false;
-            def.searchable = false;
-            def.exportOptions = { format: { body: function() { return ''; } } };
-        } else if (col === 'Hazards') {
-            def.orderable = false;
-            def.exportOptions = {
-                format: {
-                    body: function(data) {
-                        const matches = data.match(/alt="(GHS\d+)"/g);
-                        return matches ? matches.map(m => m.match(/GHS\d+/)[0]).join(', ') : '';
-                    }
-                }
+    function buildColumnDefs() {
+        return ALL_COLS.map((col, idx) => {
+            let def = {
+                targets: idx,
+                title: col,
+                visible: visibleCols.includes(col),
+                className: 'col-' + col
             };
-        } else if (col === 'CID') {
-            def.type = 'num';
-            def.exportOptions = {
-                format: {
-                    body: function(data) {
-                        const match = data.match(/>\s*(\d+)\s*</);
-                        return match ? match[1] : '';
-                    }
-                }
-            };
-        } else if (col === 'MW') {
-            def.type = 'num';
-        } else if (col === 'SMILES') {
-            def.render = function(data, type) {
-                if (type === 'display' && data.length > 50) {
-                    return '<span class="smiles-cell" title="' + data + '">' + data.substring(0, 50) + '...</span>';
-                }
-                return data;
-            };
-        }
 
-        return def;
-    });
-
-    // Initialize DataTables
-    const table = $('#results-data-table').DataTable({
-        pageLength: 25,
-        lengthMenu: [[10, 25, 50, 100, -1], [10, 25, 50, 100, "All"]],
-        order: [[ALL_COLS.indexOf('Name'), 'asc']],
-        columnDefs: columnDefs,
-        layout: {
-            topStart: ['buttons', 'pageLength'],
-            topEnd: 'search'
-        },
-        buttons: [
-            {
-                extend: 'colvis',
-                text: 'Columns',
-                columns: ':not(.no-export)'
-            },
-            {
-                extend: 'collection',
-                text: 'Export',
-                buttons: [
-                    {
-                        extend: 'csvHtml5',
-                        text: 'CSV',
-                        title: '{{ current_filter.search_name if current_filter else "Results" }} - {{ current_filter.created[:10] if current_filter else "" }}',
-                        exportOptions: { columns: ':visible:not(.col-Structure)' }
-                    },
-                    {
-                        extend: 'excelHtml5',
-                        text: 'Excel',
-                        title: '{{ current_filter.search_name if current_filter else "Results" }} - {{ current_filter.created[:10] if current_filter else "" }}',
-                        exportOptions: { columns: ':visible:not(.col-Structure)' }
-                    },
-                    {
-                        extend: 'copyHtml5',
-                        text: 'Copy to Clipboard',
-                        exportOptions: { columns: ':visible:not(.col-Structure)' }
-                    },
-                    {
-                        text: 'Print / PDF',
-                        action: function(e, dt) {
-                            dt.page.len(-1).draw();
-                            setTimeout(function() { window.print(); }, 500);
+            if (col === 'Structure') {
+                def.orderable = false;
+                def.searchable = false;
+                def.exportOptions = { format: { body: function() { return ''; } } };
+            } else if (col === 'Hazards') {
+                def.orderable = false;
+                def.exportOptions = {
+                    format: {
+                        body: function(data) {
+                            const matches = data.match(/alt="(GHS\d+)"/g);
+                            return matches ? matches.map(m => m.match(/GHS\d+/)[0]).join(', ') : '';
                         }
                     }
-                ]
+                };
+            } else if (col === 'CAS') {
+                def.exportOptions = {
+                    format: {
+                        body: function(data) {
+                            const linkMatch = data.match(/>([^<]+)<\/a>/);
+                            if (linkMatch) return linkMatch[1];
+                            const plainMatch = data.match(/<\/s>\s*([^<]+)/);
+                            if (plainMatch) return plainMatch[1];
+                            return data.replace(/<[^>]*>/g, '').trim() || '';
+                        }
+                    }
+                };
+            } else if (col === 'Formula') {
+                def.exportOptions = {
+                    format: {
+                        body: function(data) {
+                            const match = data.match(/data-plaintext="([^"]*)"/);
+                            return match ? match[1] : data.replace(/<[^>]*>/g, '').trim();
+                        }
+                    }
+                };
+            } else if (col === 'CID') {
+                def.type = 'num';
+                def.exportOptions = {
+                    format: {
+                        body: function(data) {
+                            const match = data.match(/>\s*(\d+)\s*</);
+                            return match ? match[1] : '';
+                        }
+                    }
+                };
+            } else if (col === 'MW') {
+                def.type = 'num';
+            } else if (col === 'SMILES') {
+                def.render = function(data, type) {
+                    if (type === 'display' && data.length > 50) {
+                        return '<span class="smiles-cell" title="' + data + '">' + data.substring(0, 50) + '...</span>';
+                    }
+                    return data;
+                };
             }
-        ],
-        stateSave: true,
-        stateSaveCallback: function(settings, data) {
-            const visible = [];
-            settings.aoColumns.forEach((col, idx) => {
-                if (col.bVisible) visible.push(ALL_COLS[idx]);
+
+            return def;
+        });
+    }
+
+    function buildDTConfig(tableId) {
+        return {
+            pageLength: 25,
+            lengthMenu: [[10, 25, 50, 100, -1], [10, 25, 50, 100, "All"]],
+            order: [[ALL_COLS.indexOf('Name'), 'asc']],
+            columnDefs: buildColumnDefs(),
+            layout: {
+                topStart: ['buttons', 'pageLength'],
+                topEnd: 'search'
+            },
+            buttons: [
+                {
+                    extend: 'colvis',
+                    text: 'Columns',
+                    columns: ':not(.no-export)'
+                },
+                {
+                    extend: 'collection',
+                    text: 'Export',
+                    buttons: [
+                        {
+                            extend: 'csvHtml5',
+                            text: 'CSV',
+                            title: '{{ current_filter.search_name if current_filter else "Results" }} - {{ current_filter.created[:10] if current_filter else "" }}',
+                            exportOptions: { columns: ':visible:not(.col-Structure)' }
+                        },
+                        {
+                            extend: 'excelHtml5',
+                            text: 'Excel',
+                            title: '{{ current_filter.search_name if current_filter else "Results" }} - {{ current_filter.created[:10] if current_filter else "" }}',
+                            exportOptions: { columns: ':visible:not(.col-Structure)' }
+                        },
+                        {
+                            extend: 'copyHtml5',
+                            text: 'Copy to Clipboard',
+                            exportOptions: { columns: ':visible:not(.col-Structure)' }
+                        },
+                        {
+                            text: 'Print / PDF',
+                            action: function(e, dt) {
+                                const visibleCount = dt.columns(':visible').count();
+                                const $tableWrapper = $('.table-responsive:visible');
+                                if (visibleCount > 7) {
+                                    $tableWrapper.addClass('print-scale-many');
+                                }
+                                dt.page.len(-1).draw();
+                                setTimeout(function() {
+                                    window.print();
+                                    setTimeout(function() {
+                                        $tableWrapper.removeClass('print-scale-many');
+                                    }, 1000);
+                                }, 500);
+                            }
+                        }
+                    ]
+                }
+            ],
+            stateSave: true,
+            stateSaveCallback: function(settings, data) {
+                const visible = [];
+                settings.aoColumns.forEach((col, idx) => {
+                    if (col.bVisible) visible.push(ALL_COLS[idx]);
+                });
+                visibleCols = visible;
+                localStorage.setItem('results_visible_cols', JSON.stringify(visible));
+                localStorage.setItem('DataTables_' + tableId, JSON.stringify(data));
+            },
+            stateLoadCallback: function() {
+                try {
+                    return JSON.parse(localStorage.getItem('DataTables_' + tableId));
+                } catch(e) {
+                    return null;
+                }
+            },
+            language: {
+                search: "Search chemicals:",
+                lengthMenu: "Show _MENU_ rows",
+                info: "Showing _START_ to _END_ of _TOTAL_ chemicals",
+                infoEmpty: "No chemicals found",
+                infoFiltered: "(filtered from _MAX_ total)",
+                zeroRecords: "No matching chemicals found"
+            },
+            initComplete: function() {
+                var $btnGroup = $(this.api().table().container()).find('.dt-buttons');
+                var active = localStorage.getItem('results_group_identical') !== 'false';
+                var $pill = $('<span id="group-toggle" style="cursor:pointer;font-size:0.8rem;padding:4px 10px;border-radius:12px;border:1px solid var(--accent);user-select:none;margin-left:8px;align-content:center;"></span>').text('Group identical');
+                function applyStyle() {
+                    if (active) {
+                        $pill.css({background:'var(--highlight)',color:'#fff'});
+                    } else {
+                        $pill.css({background:'transparent',color:'var(--text-dim)'});
+                    }
+                }
+                applyStyle();
+                $pill.on('click', function() {
+                    grouped = !grouped;
+                    active = grouped;
+                    localStorage.setItem('results_group_identical', grouped ? 'true' : 'false');
+                    if (activeTable) { activeTable.destroy(); activeTable = null; }
+                    initActiveTable();
+                });
+                $btnGroup.append($pill);
+            }
+        };
+    }
+
+    // Group toggle logic
+    var grouped = localStorage.getItem('results_group_identical') !== 'false';
+    var activeTable = null;
+
+    function initActiveTable() {
+        if (grouped) {
+            $('#individual-table-wrapper').hide();
+            $('#grouped-table-wrapper').show();
+            if ($.fn.dataTable.isDataTable('#results-data-table')) {
+                $('#results-data-table').DataTable().destroy();
+            }
+            activeTable = $('#results-grouped-table').DataTable(buildDTConfig('results-grouped'));
+            activeTable.on('column-visibility.dt', function(e, settings) {
+                var visible = [];
+                settings.aoColumns.forEach(function(col, idx) {
+                    if (col.bVisible) visible.push(ALL_COLS[idx]);
+                });
+                visibleCols = visible;
+                localStorage.setItem('results_visible_cols', JSON.stringify(visible));
             });
-            localStorage.setItem('results_visible_cols', JSON.stringify(visible));
-            localStorage.setItem('DataTables_results', JSON.stringify(data));
-        },
-        stateLoadCallback: function() {
-            try {
-                return JSON.parse(localStorage.getItem('DataTables_results'));
-            } catch(e) {
-                return null;
+        } else {
+            $('#grouped-table-wrapper').hide();
+            $('#individual-table-wrapper').show();
+            if ($.fn.dataTable.isDataTable('#results-grouped-table')) {
+                $('#results-grouped-table').DataTable().destroy();
             }
-        },
-        language: {
-            search: "Search chemicals:",
-            lengthMenu: "Show _MENU_ rows",
-            info: "Showing _START_ to _END_ of _TOTAL_ chemicals",
-            infoEmpty: "No chemicals found",
-            infoFiltered: "(filtered from _MAX_ total)",
-            zeroRecords: "No matching chemicals found"
+            activeTable = $('#results-data-table').DataTable(buildDTConfig('results'));
+            activeTable.on('column-visibility.dt', function(e, settings) {
+                var visible = [];
+                settings.aoColumns.forEach(function(col, idx) {
+                    if (col.bVisible) visible.push(ALL_COLS[idx]);
+                });
+                visibleCols = visible;
+                localStorage.setItem('results_visible_cols', JSON.stringify(visible));
+            });
         }
+        window._activeTable = activeTable;
+    }
+
+    initActiveTable();
+
+    $(document).on('click', '.vary-pop', function(e) {
+        $('.vary-popover').remove();
+        var content = $(this).next('.vary-pop-content').text();
+        var $pop = $('<div class="vary-popover"></div>').text(content)
+            .css({position:'absolute', background:'var(--bg-card)', border:'1px solid var(--border)',
+                  borderRadius:'6px', padding:'8px 12px', fontSize:'0.8rem', maxWidth:'300px',
+                  zIndex:1000, boxShadow:'0 2px 8px rgba(0,0,0,0.15)', wordBreak:'break-word'});
+        $('body').append($pop);
+        var rect = this.getBoundingClientRect();
+        $pop.css({top: rect.bottom + window.scrollY + 4, left: rect.left + window.scrollX});
+    });
+    $(document).on('click', function(e) {
+        if (!$(e.target).hasClass('vary-pop')) $('.vary-popover').remove();
     });
 
-    // Update localStorage on column visibility change
-    table.on('column-visibility.dt', function(e, settings, column, state) {
-        const visible = [];
-        settings.aoColumns.forEach((col, idx) => {
-            if (col.bVisible) visible.push(ALL_COLS[idx]);
-        });
-        localStorage.setItem('results_visible_cols', JSON.stringify(visible));
-    });
 });
 
 // Keep compound info polling
@@ -1784,10 +2009,10 @@ window._fIdx = { mw: -1, formula: -1, loc: -1 };
 window._mwSlider = null;
 
 $(document).ready(function() {
-    var dt = $('#results-data-table');
-    if (!dt.length) { console.log('[Filters] No results table found, skipping'); return; }
+    if (!window._activeTable) { console.log('[Filters] No results table found, skipping'); return; }
 
-    var tbl = dt.DataTable();
+    var tbl = window._activeTable;
+    var tbl = window._activeTable;
     var headers = [];
     tbl.columns().header().each(function(h) { headers.push($(h).text().trim()); });
     window._fIdx.mw = headers.indexOf('MW');
@@ -1838,7 +2063,7 @@ $(document).ready(function() {
 
     // --- Register DataTables custom search function ---
     $.fn.dataTable.ext.search.push(function(settings, data) {
-        if (settings.nTable.id !== 'results-data-table') return true;
+        if (settings.nTable.id !== 'results-data-table' && settings.nTable.id !== 'results-grouped-table') return true;
         var fs = window._filterState;
         var idx = window._fIdx;
 
@@ -1849,7 +2074,9 @@ $(document).ready(function() {
             }
         }
         if (idx.formula >= 0 && fs.formula) {
-            if ((data[idx.formula] || '').toLowerCase().indexOf(fs.formula) === -1) return false;
+            const cellData = data[idx.formula];
+            const plaintext = cellData && cellData.match(/data-plaintext="([^"]*)"/) ? cellData.match(/data-plaintext="([^"]*)"/)[1] : cellData;
+            if ((plaintext || '').toLowerCase().indexOf(fs.formula) === -1) return false;
         }
         if (idx.loc >= 0 && fs.location) {
             if ((data[idx.loc] || '').trim() !== fs.location) return false;
@@ -1870,7 +2097,7 @@ $(document).ready(function() {
         window._filterState.formula = ($('#formula-filter').val() || '').toLowerCase();
         window._filterState.location = $('#location-filter').val() || '';
         console.log('[Filters] Formula:', window._filterState.formula, 'Location:', window._filterState.location);
-        tbl.draw();
+        if (window._activeTable) window._activeTable.draw();
         console.log('[Filters] Table redrawn');
     });
 
@@ -1882,7 +2109,7 @@ $(document).ready(function() {
         $('#formula-filter').val('');
         $('#location-filter').val('');
         window._filterState = { mwLo: window._mwDataMin, mwHi: window._mwDataMax, formula: '', location: '' };
-        tbl.draw();
+        if (window._activeTable) window._activeTable.draw();
         console.log('[Filters] Filters cleared, table redrawn');
     });
 
@@ -2741,6 +2968,28 @@ def results_page():
 
                     filtered_rows.append(row)
 
+    # Build grouped rows (group by CAS number)
+    from collections import OrderedDict
+    identity_cols = {'Structure', 'Name', 'CAS', 'Formula', 'MW', 'Hazards', 'SMILES', 'IUPAC', 'CID'}
+    varying_cols = ['GROSname', 'Pot', 'Location', 'Owner', 'OwnerRegNumber']
+    cas_groups = OrderedDict()
+    for row in filtered_rows:
+        cas = row.get('Casnr', '') or ''
+        cas_groups.setdefault(cas, []).append(row)
+    grouped_rows = []
+    for cas, group in cas_groups.items():
+        rep = dict(group[0])  # copy representative row
+        rep['_group_count'] = len(group)
+        varying = {}
+        for vc in varying_cols:
+            unique_vals = list(OrderedDict.fromkeys(
+                r.get(vc, '') or '-' for r in group
+            ))
+            if len(unique_vals) > 1:
+                varying[vc] = unique_vals
+        rep['_group_varying'] = varying
+        grouped_rows.append(rep)
+
     # Determine visible columns from defaults (JS will override via localStorage)
     visible_columns = list(DEFAULT_RESULTS_COLUMNS)
 
@@ -2758,6 +3007,7 @@ def results_page():
         filter_results=filter_results,
         current_filter=current_filter,
         filtered_rows=filtered_rows,
+        grouped_rows=grouped_rows,
         all_columns=ALL_RESULTS_COLUMNS,
         default_columns=DEFAULT_RESULTS_COLUMNS,
         visible_columns=visible_columns,
@@ -3697,6 +3947,58 @@ def quit_app():
         os._exit(0)
     threading.Thread(target=shutdown, daemon=True).start()
     return jsonify({"status": "shutting_down"})
+
+
+@app.route("/api/check-update")
+def check_update():
+    """Check GitHub for a newer release."""
+    try:
+        from packaging.version import Version
+    except ImportError:
+        # Fallback: simple tuple comparison
+        Version = None
+
+    def parse_ver(v):
+        parts = v.lstrip("v").split(".")
+        return tuple(int(x) for x in parts)
+
+    try:
+        resp = _requests.get(
+            "https://api.github.com/repos/mf-rug/rug_chemsearch_cl/releases/latest",
+            timeout=10,
+            headers={"Accept": "application/vnd.github+json"},
+        )
+        if resp.status_code == 404:
+            return jsonify({"update_available": False, "current": APP_VERSION,
+                            "latest": APP_VERSION, "message": "No releases published yet."})
+        resp.raise_for_status()
+        data = resp.json()
+        latest_tag = data.get("tag_name", "v0.0.0")
+        latest_ver = latest_tag.lstrip("v")
+        release_notes = data.get("body", "") or ""
+
+        # Find zip asset download URL
+        download_url = data.get("html_url", "")
+        for asset in data.get("assets", []):
+            if asset["name"].endswith(".zip"):
+                download_url = asset["browser_download_url"]
+                break
+
+        if Version:
+            update_available = Version(latest_ver) > Version(APP_VERSION)
+        else:
+            update_available = parse_ver(latest_ver) > parse_ver(APP_VERSION)
+
+        return jsonify({
+            "update_available": update_available,
+            "current": APP_VERSION,
+            "latest": latest_ver,
+            "download_url": download_url,
+            "release_notes": release_notes,
+        })
+    except Exception as e:
+        return jsonify({"update_available": False, "current": APP_VERSION,
+                        "latest": APP_VERSION, "error": str(e)}), 200
 
 
 # ============================================================================
