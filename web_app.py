@@ -23,7 +23,7 @@ if sys.stdout is None:
     print(f"Session started: {datetime.now().isoformat()}")
     print(f"{'='*50}")
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 import json
 from datetime import datetime
@@ -744,13 +744,35 @@ BASE_TEMPLATE = """
                     el.innerHTML = data.message || 'You\u2019re on the latest version (v' + data.current + ').';
                 } else {
                     let notes = data.release_notes ? '<p style="margin:8px 0;white-space:pre-wrap;max-height:120px;overflow:auto;font-size:0.8rem;background:var(--bg-card);padding:8px;border-radius:4px;">' + data.release_notes.replace(/</g,'&lt;') + '</p>' : '';
+                    let action = '';
+                    if (data.is_git) {
+                        action = '<button onclick="gitPullUpdate(this)" class="btn" style="font-size:0.85rem;padding:6px 14px;margin-top:6px;">Update via git pull</button>' +
+                            '<p style="margin-top:8px;font-size:0.8rem;color:var(--text-dim);">This will run <code>git pull</code> to update your local copy. Restart the app afterwards.</p>';
+                    } else {
+                        action = '<a href="' + data.download_url + '" target="_blank" class="btn" style="font-size:0.85rem;padding:6px 14px;margin-top:6px;display:inline-block;">Download</a>' +
+                            '<p style="margin-top:8px;font-size:0.8rem;color:var(--text-dim);">Download the zip, close this app, replace your ChemicalExtractor folder contents with the new files, and relaunch.</p>';
+                    }
                     el.innerHTML = '<strong>v' + data.latest + ' is available!</strong> (you have v' + data.current + ')' +
-                        notes +
-                        '<a href="' + data.download_url + '" target="_blank" class="btn" style="font-size:0.85rem;padding:6px 14px;margin-top:6px;display:inline-block;">Download</a>' +
-                        '<p style="margin-top:8px;font-size:0.8rem;color:var(--text-dim);">Download the zip, close this app, replace your ChemicalExtractor folder contents with the new files, and relaunch.</p>';
+                        notes + action;
                 }
             })
             .catch(() => { el.innerHTML = 'Could not check for updates (no internet?).'; });
+    }
+    function gitPullUpdate(btn) {
+        btn.disabled = true;
+        btn.textContent = 'Updating...';
+        fetch('/api/git-pull', {method:'POST'})
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    btn.textContent = 'Updated!';
+                    btn.parentElement.querySelector('p').innerHTML = 'Update complete. <strong>Restart the app</strong> to use the new version.';
+                } else {
+                    btn.textContent = 'Update failed';
+                    btn.parentElement.querySelector('p').textContent = data.error || 'Unknown error';
+                }
+            })
+            .catch(() => { btn.textContent = 'Update failed'; });
     }
     </script>
     {% block scripts %}{% endblock %}
@@ -816,9 +838,8 @@ SEARCH_TEMPLATE = """
             </button>
         </div>
         <button class="btn btn-success" id="direct-search-btn" onclick="directPubchemSearch(this, false)">Search</button>
-        <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 0.85rem; user-select: none; padding: 4px 10px; border-radius: 12px; border: 1px solid var(--accent); color: var(--text-dim);">
-            <input type="checkbox" id="exclude-toggle" style="margin: 0;"> Exclude
-        </label>
+        <input type="checkbox" id="exclude-toggle" style="display:none;">
+        <button class="mode-pill" id="exclude-pill" onclick="let c=document.getElementById('exclude-toggle');c.checked=!c.checked;this.classList.toggle('active',c.checked);">Exclude</button>
     </div>
     <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
         <div class="mode-selector" style="margin-bottom: 0;">
@@ -3962,32 +3983,61 @@ def check_update():
         parts = v.lstrip("v").split(".")
         return tuple(int(x) for x in parts)
 
+    # Detect if running from a git repo (source install) vs PyInstaller
+    import subprocess
+    is_git = False
     try:
+        subprocess.run(["git", "rev-parse", "--git-dir"], capture_output=True,
+                       check=True, cwd=os.path.dirname(__file__) or ".")
+        is_git = True
+    except Exception:
+        pass
+
+    try:
+        headers = {"Accept": "application/vnd.github+json"}
+
+        # First try releases
         resp = _requests.get(
             "https://api.github.com/repos/mf-rug/rug_chemsearch_cl/releases/latest",
-            timeout=10,
-            headers={"Accept": "application/vnd.github+json"},
+            timeout=10, headers=headers,
         )
-        if resp.status_code == 404:
-            return jsonify({"update_available": False, "current": APP_VERSION,
-                            "latest": APP_VERSION, "message": "No releases published yet."})
-        resp.raise_for_status()
-        data = resp.json()
-        latest_tag = data.get("tag_name", "v0.0.0")
-        latest_ver = latest_tag.lstrip("v")
-        release_notes = data.get("body", "") or ""
+        release_data = None
+        if resp.status_code != 404:
+            resp.raise_for_status()
+            release_data = resp.json()
 
-        # Find zip asset download URL
-        download_url = data.get("html_url", "")
-        for asset in data.get("assets", []):
-            if asset["name"].endswith(".zip"):
-                download_url = asset["browser_download_url"]
-                break
+        # Also check latest tag for source installs or if no release exists
+        latest_ver = None
+        if release_data:
+            latest_ver = release_data.get("tag_name", "v0.0.0").lstrip("v")
+        else:
+            tag_resp = _requests.get(
+                "https://api.github.com/repos/mf-rug/rug_chemsearch_cl/tags?per_page=1",
+                timeout=10, headers=headers,
+            )
+            tag_resp.raise_for_status()
+            tags = tag_resp.json()
+            if tags:
+                latest_ver = tags[0]["name"].lstrip("v")
+            else:
+                return jsonify({"update_available": False, "current": APP_VERSION,
+                                "latest": APP_VERSION, "message": "No versions published yet."})
 
         if Version:
             update_available = Version(latest_ver) > Version(APP_VERSION)
         else:
             update_available = parse_ver(latest_ver) > parse_ver(APP_VERSION)
+
+        # Build download URL and notes
+        release_notes = ""
+        download_url = f"https://github.com/mf-rug/rug_chemsearch_cl/releases/tag/v{latest_ver}"
+        if release_data:
+            release_notes = release_data.get("body", "") or ""
+            download_url = release_data.get("html_url", download_url)
+            for asset in release_data.get("assets", []):
+                if asset["name"].endswith(".zip"):
+                    download_url = asset["browser_download_url"]
+                    break
 
         return jsonify({
             "update_available": update_available,
@@ -3995,10 +4045,27 @@ def check_update():
             "latest": latest_ver,
             "download_url": download_url,
             "release_notes": release_notes,
+            "is_git": is_git,
         })
     except Exception as e:
         return jsonify({"update_available": False, "current": APP_VERSION,
                         "latest": APP_VERSION, "error": str(e)}), 200
+
+
+@app.route("/api/git-pull", methods=["POST"])
+def git_pull():
+    """Run git pull to update a source install."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "pull"], capture_output=True, text=True, timeout=30,
+            cwd=os.path.dirname(__file__) or ".",
+        )
+        if result.returncode == 0:
+            return jsonify({"success": True, "output": result.stdout})
+        return jsonify({"success": False, "error": result.stderr or result.stdout})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
 
 
 # ============================================================================
