@@ -23,7 +23,7 @@ if sys.stdout is None:
     print(f"Session started: {datetime.now().isoformat()}")
     print(f"{'='*50}")
 
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 
 import json
 from datetime import datetime
@@ -765,8 +765,12 @@ BASE_TEMPLATE = """
             .then(r => r.json())
             .then(data => {
                 if (data.success) {
-                    btn.textContent = 'Updated!';
-                    btn.parentElement.querySelector('p').innerHTML = 'Update complete. <strong>Restart the app</strong> to use the new version.';
+                    btn.textContent = 'Updated! Restarting...';
+                    btn.parentElement.querySelector('p').innerHTML = 'The app is restarting. This page will reload automatically.';
+                    // Wait for the server to come back, then reload
+                    setTimeout(function tryReload() {
+                        fetch('/api/check-update').then(() => location.reload()).catch(() => setTimeout(tryReload, 500));
+                    }, 2000);
                 } else {
                     btn.textContent = 'Update failed';
                     btn.parentElement.querySelector('p').textContent = data.error || 'Unknown error';
@@ -4075,7 +4079,13 @@ def git_pull():
             cwd=repo_dir,
         )
         if result.returncode == 0:
-            return jsonify({"success": True, "output": result.stdout})
+            # Schedule a restart after the response is sent
+            def restart():
+                import time
+                time.sleep(1)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            threading.Thread(target=restart, daemon=True).start()
+            return jsonify({"success": True, "output": result.stdout, "restarting": True})
         return jsonify({"success": False, "error": result.stderr or result.stdout})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
